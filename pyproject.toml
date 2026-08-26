@@ -1,0 +1,55 @@
+[project]
+name = "quiz-battle-service"
+version = "0.1.0"
+description = "Online 1v1 competitive quiz battle microservice — matchmaking, Elo rating, subject leaderboards, and live WebSocket gameplay. Extracted from Personalized-Quiz-Service; shares its Postgres database (real FKs into users/questions) but is deployed and versioned independently."
+requires-python = ">=3.12"
+dependencies = [
+    # ── Web Framework ──────────────────────────────────────────────────────
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",   # ASGI server with websocket & HTTP/2 support
+    "websockets>=12.0",            # explicit (not just relying on uvicorn[standard]'s extra) -- scripts/verify_battle_live.py imports it directly as a client
+    # ── Database ───────────────────────────────────────────────────────────
+    "sqlalchemy>=2.0.0",           # Async ORM (2.x API)
+    "asyncpg>=0.29.0",             # Async PostgreSQL driver (used by SQLAlchemy)
+    "aiosqlite>=0.20.0",           # Async SQLite driver for local development fallback
+    "greenlet>=3.0.0",             # Required by SQLAlchemy's async engine bridge
+    "alembic>=1.13.0",             # Schema migrations (see alembic/versions/) -- own alembic_version_quiz_online history, shares the DB with Personalized-Quiz-Service
+    # ── Configuration & Validation ─────────────────────────────────────────
+    "pydantic>=2.7.0",             # Data validation (v2)
+    "pydantic-settings>=2.3.0",    # Settings management with .env support
+    "python-dotenv>=1.0.0",        # Loads .env into os.environ
+    # ── Authentication ─────────────────────────────────────────────────────
+    "PyJWT>=2.8.0",                # JWT decoding
+    "cryptography>=42.0.0",        # RSA key support for PyJWT (RS256)
+    "httpx>=0.27.0",               # Async HTTP client (used for JWKS fetch)
+    # ── AI / Groq ──────────────────────────────────────────────────────────
+    "groq>=0.9.0",                 # Official Groq Python SDK -- own client, used to top up the shared question pool when it falls short
+    # ── Utilities ──────────────────────────────────────────────────────────
+    "python-multipart>=0.0.9",     # Required for FastAPI form data
+    # ── Caching / Matchmaking ────────────────────────────────────────────
+    "redis>=5.0.0",                # Async Redis client (redis.asyncio) -- matchmaking queues, ready state, disconnect presence, WS pub/sub
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",               # Test runner
+    "pytest-asyncio>=0.23.0",      # Async test support (async def test_* functions)
+    "fakeredis[lua]>=2.20.0",      # In-memory Redis for tests, incl. Lua/EVAL support (pulls in lupa)
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# `param: X = Depends(...)` (and friends) is FastAPI's own dependency-
+# injection idiom, not the mutable-default-argument bug B008 exists to
+# catch -- these calls return lightweight marker objects, not shared state.
+# See https://fastapi.tiangolo.com/tutorial/dependencies/#to-async-or-not-to-async
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.params.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Form",
+    "fastapi.File",
+]

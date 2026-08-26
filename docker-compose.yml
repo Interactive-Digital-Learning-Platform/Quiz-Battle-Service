@@ -1,0 +1,60 @@
+version: "3.9"
+
+# ── Services ──────────────────────────────────────────────────────────────────
+# Note: No database service is defined here because we use Neon (serverless
+# PostgreSQL), the SAME database Personalized-Quiz-Service uses. DATABASE_URL
+# in .env must point at that same Neon instance -- this service reads/writes
+# users/questions (owned by Personalized-Quiz-Service) and owns
+# battle_matches/battle_participants/battle_match_questions/battle_answers/
+# competitive_subject_ratings itself.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Host port 8005 -- next in the existing service port sequence (pdf=8001,
+    # assistant=8002, quiz=8003, notes=8004). The nginx gateway in
+    # Deployment-Infrastructure/ proxies /api/battle/ to this port.
+    ports:
+      - "8005:8000"
+
+    env_file:
+      - .env
+
+    restart: unless-stopped
+
+    # Override the CMD for development: add --reload for hot reloading.
+    # In production, remove the `command` key entirely to use the Dockerfile CMD.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+    volumes:
+      - .:/app
+
+    depends_on:
+      - redis
+
+  # ── Redis (matchmaking queues, ready state, disconnect presence, WS pub/sub) ──
+  # Transient state only -- Postgres/Neon remains the source of truth once two
+  # players are paired. Local dev only; production Redis provisioning is a
+  # separate ops task.
+  #
+  # NOTE: Deployment-Infrastructure's own docker-compose.yaml also runs a
+  # redis container mapped to host port 6379 (for the PDF ingestion service).
+  # Only one of the two host-port-6379 mappings can be up at a time locally --
+  # point REDIS_URL at whichever instance is actually running (they're
+  # interchangeable for this service's purposes; battle:* keys don't collide
+  # with anything else).
+  redis:
+    image: "redis:7-alpine"
+
+    ports:
+      - "6379:6379"
+
+    restart: unless-stopped
+
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
