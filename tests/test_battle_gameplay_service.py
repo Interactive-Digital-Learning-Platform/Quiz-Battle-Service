@@ -737,3 +737,117 @@ async def test_match_completes_automatically_once_total_time_budget_elapses(db_s
     )
     assert state["status"] == "completed"
     assert state["result"]["winner_user_id"] is None  # neither answered anything -- draw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# get_battle_history -- batched (not N+1) match/participant/username lookups
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _seed_rating_if_absent(db, user_id: int, subject: str, rating: int) -> None:
+    """Same subject/user pair gets seeded across multiple matches in the
+    history tests below -- plain _seed_rating would violate the
+    (user_id, subject) unique constraint on the second call.
+    """
+    existing = (
+        await db.execute(
+            select(CompetitiveSubjectRating).where(
+                CompetitiveSubjectRating.user_id == user_id, CompetitiveSubjectRating.subject == subject,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        await _seed_rating(db, user_id, subject, rating)
+
+
+async def _complete_match_with_winner(db, redis, *, subject, winner_id, loser_id) -> BattleMatch:
+    """Winner answers every question correctly, loser answers none, then the
+    total time budget is exhausted so completion runs -- mirrors
+    test_completion_is_idempotent_and_rating_matches_elo_engine's approach.
+    """
+    await _seed_rating_if_absent(db, winner_id, subject, 1000)
+    await _seed_rating_if_absent(db, loser_id, subject, 1000)
+    match = await _create_waiting_match(
+        db, subject=subject, difficulty="Mostly Medium",
+        user_a_id=winner_id, rating_a=1000, user_b_id=loser_id, rating_b=1000,
+    )
+    _, questions = await _seed_and_activate(db, redis, match, user_a_id=winner_id, user_b_id=loser_id)
+
+    for i in range(N):
+        await _set_started_at(db, match.id, datetime.now(UTC) - timedelta(seconds=i * Q + 1))
+        await battle_gameplay_service.submit_battle_answer(
+            db, match_id=match.id, user_id=winner_id, question_id=questions[i].id, selected_option="A",
+        )
+
+    await redis.hset(f"battle:user_state:{winner_id}", "state", "in_match")
+    await redis.hset(f"battle:user_state:{loser_id}", "state", "in_match")
+    await _set_started_at(db, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL + 1))
+    await battle_gameplay_service.get_match_state(db, match_id=match.id, user_id=winner_id, redis=redis)
+    await db.refresh(match)
+    return match
+
+
+async def test_get_battle_history_returns_matches_newest_finished_first(db_session, fake_redis):
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    user_c = await _make_user(db_session, "user-c")
+
+    older = await _complete_match_with_winner(
+        db_session, fake_redis, subject="Mathematics", winner_id=user_a.id, loser_id=user_b.id,
+    )
+    newer = await _complete_match_with_winner(
+        db_session, fake_redis, subject="Mathematics", winner_id=user_c.id, loser_id=user_a.id,
+    )
+
+    history = await battle_gameplay_service.get_battle_history(
+        db_session, user_id=user_a.id, subject=None, page=1, page_size=20,
+    )
+
+    assert history["total_count"] == 2
+    assert history["total_pages"] == 1
+    assert [e["match_id"] for e in history["entries"]] == [newer.id, older.id]
+
+    newest_entry, older_entry = history["entries"]
+    assert newest_entry["opponent_user_id"] == user_c.id
+    assert newest_entry["opponent_username"] == user_c.username
+    assert newest_entry["winner_user_id"] == user_c.id
+    assert newest_entry["me"]["result"] == "loss"
+    assert newest_entry["opponent"]["result"] == "win"
+
+    assert older_entry["opponent_user_id"] == user_b.id
+    assert older_entry["opponent_username"] == user_b.username
+    assert older_entry["winner_user_id"] == user_a.id
+    assert older_entry["me"]["result"] == "win"
+
+
+async def test_get_battle_history_pagination(db_session, fake_redis):
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    user_c = await _make_user(db_session, "user-c")
+
+    older = await _complete_match_with_winner(
+        db_session, fake_redis, subject="Mathematics", winner_id=user_a.id, loser_id=user_b.id,
+    )
+    await _complete_match_with_winner(
+        db_session, fake_redis, subject="Mathematics", winner_id=user_c.id, loser_id=user_a.id,
+    )
+
+    page1 = await battle_gameplay_service.get_battle_history(
+        db_session, user_id=user_a.id, subject=None, page=1, page_size=1,
+    )
+    page2 = await battle_gameplay_service.get_battle_history(
+        db_session, user_id=user_a.id, subject=None, page=2, page_size=1,
+    )
+
+    assert page1["total_count"] == 2
+    assert page1["total_pages"] == 2
+    assert len(page1["entries"]) == 1
+    assert len(page2["entries"]) == 1
+    assert page2["entries"][0]["match_id"] == older.id
+
+
+async def test_get_battle_history_empty_for_user_with_no_completed_matches(db_session, fake_redis):
+    user = await _make_user(db_session, "user-lonely")
+    history = await battle_gameplay_service.get_battle_history(
+        db_session, user_id=user.id, subject=None, page=1, page_size=20,
+    )
+    assert history == {"page": 1, "page_size": 20, "total_count": 0, "total_pages": 0, "entries": []}

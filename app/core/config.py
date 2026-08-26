@@ -158,10 +158,16 @@ class Settings(BaseSettings):
     # How long a match may sit at status="waiting" before the reaper treats
     # it as orphaned (the crash window between matchmaking's Postgres commit
     # and its Redis finalize step -- see matchmaking_service.py's module
-    # docstring). Generous, well past BATTLE_MATCHMAKING_CLAIM_TTL_SECONDS
-    # (20s default) so a merely-slow client is never mistaken for a crash.
-    BATTLE_ORPHANED_MATCH_REAP_AFTER_SECONDS: float = 120.0
-    BATTLE_STALE_MATCH_REAPER_INTERVAL_SECONDS: float = 60.0
+    # docstring). Still well past BATTLE_MATCHMAKING_CLAIM_TTL_SECONDS (20s
+    # default) so a merely-slow client is never mistaken for a crash -- 60s
+    # is 3x that, plenty of margin, while keeping the "wrapping up" wait a
+    # genuinely abandoned player sees short rather than a multi-minute one.
+    BATTLE_ORPHANED_MATCH_REAP_AFTER_SECONDS: float = 60.0
+    # How often the reaper loop itself runs -- lightweight queries (two
+    # indexed status/timestamp scans), so checking frequently costs little
+    # and directly bounds how long a match that just crossed a reap cutoff
+    # above sits there unreaped before anyone waiting on it notices.
+    BATTLE_STALE_MATCH_REAPER_INTERVAL_SECONDS: float = 15.0
     # How long a match may sit at status="countdown"/"active" with no client
     # ever revisiting it before the same reaper treats it as abandoned (both
     # players gone -- e.g. closed the app right after the match started).
@@ -183,7 +189,12 @@ class Settings(BaseSettings):
     # unable to queue if a match's post-commit release_match_state() call
     # ever failed (transient Redis error, etc.), since "in_match" has no TTL
     # by design and nothing else ever revisits an already-terminal match.
-    BATTLE_IN_MATCH_RECONCILE_INTERVAL_SECONDS: float = 120.0
+    # This is also the MOST common real trigger behind the mobile app's
+    # "wrapping up" UI (OnlineList's FAB), since it's the exact case of
+    # "Postgres already knows this match is over, Redis just hasn't caught
+    # up yet" -- kept short (20s) so that wait stays brief rather than the
+    # 2 minutes this used to allow.
+    BATTLE_IN_MATCH_RECONCILE_INTERVAL_SECONDS: float = 20.0
     # Fixed-window (INCR+EXPIRE) rate limits -- see app/services/rate_limiter.py.
     BATTLE_QUEUE_JOIN_RATE_LIMIT_MAX_CALLS: int = 5
     BATTLE_QUEUE_JOIN_RATE_LIMIT_WINDOW_SECONDS: int = 10

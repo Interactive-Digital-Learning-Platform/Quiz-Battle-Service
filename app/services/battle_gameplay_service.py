@@ -735,18 +735,40 @@ async def get_battle_history(
         )
     ).scalars().all()
 
+    if not match_ids:
+        return {"page": page, "page_size": page_size, "total_count": total_count, "total_pages": 0, "entries": []}
+
+    # Batched into 3 queries total (regardless of page size) rather than
+    # ~3 round trips PER match in a loop (one match fetch, one participants
+    # fetch, one username lookup EACH) -- that N+1 pattern was the main
+    # cause of slow history loads.
+    matches_by_id = {
+        m.id: m
+        for m in (
+            await db.execute(select(BattleMatch).where(BattleMatch.id.in_(match_ids)))
+        ).scalars().all()
+    }
+    participants_by_match: dict[int, list[BattleParticipant]] = {}
+    for p in (
+        await db.execute(select(BattleParticipant).where(BattleParticipant.match_id.in_(match_ids)))
+    ).scalars().all():
+        participants_by_match.setdefault(p.match_id, []).append(p)
+
+    opponent_ids = set()
+    for participants in participants_by_match.values():
+        opponent_ids.update(p.user_id for p in participants if p.user_id != user_id)
+    usernames_by_id = dict(
+        (
+            await db.execute(select(User.id, User.username).where(User.id.in_(opponent_ids)))
+        ).all()
+    ) if opponent_ids else {}
+
     entries = []
     for match_id in match_ids:
-        match = await db.get(BattleMatch, match_id)
-        participants = await _get_participants(db, match_id)
+        match = matches_by_id[match_id]
+        participants = participants_by_match.get(match_id, [])
         me = next(p for p in participants if p.user_id == user_id)
         opponent = next((p for p in participants if p.user_id != user_id), None)
-
-        opponent_username = None
-        if opponent is not None:
-            opponent_username = (
-                await db.execute(select(User.username).where(User.id == opponent.user_id))
-            ).scalar_one_or_none()
 
         entries.append(
             {
@@ -754,7 +776,7 @@ async def get_battle_history(
                 "started_at": match.started_at, "finished_at": match.finished_at,
                 "winner_user_id": match.winner_user_id,
                 "opponent_user_id": opponent.user_id if opponent is not None else None,
-                "opponent_username": opponent_username,
+                "opponent_username": usernames_by_id.get(opponent.user_id) if opponent is not None else None,
                 "me": participant_result_payload(me),
                 "opponent": participant_result_payload(opponent) if opponent is not None else None,
             }
