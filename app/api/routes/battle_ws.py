@@ -214,11 +214,35 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
     (match.started_at). Sleeps until the current question's window closes
     (or, once the last question's window closes, until
     _ensure_match_progressed's elapsed-time check can finalize the match).
+
+    The stop check below is deliberately placed AFTER
+    _ensure_match_progressed, not as the `while` loop's own condition: both
+    players' connections can close (stop_event.set()) at the exact instant
+    the final question's window closes, waking `_sleep_or_stop` via the stop
+    signal rather than its timeout. Exiting right there, before ever
+    re-running _ensure_match_progressed, used to skip the one check that
+    would have finalized an already-time-expired match -- leaving it stuck
+    "active" in Postgres and "in_match" in Redis (no TTL) until the
+    stale-match reaper's much longer BATTLE_ACTIVE_MATCH_REAP_AFTER_SECONDS
+    cutoff (10 minutes) caught it. Looping back for one more pass first
+    means a match whose time already ran out gets finalized regardless of
+    whether anyone is still connected to see it happen.
+
+    `previous_status` doubles as "has this task ever observed the match
+    non-terminal": a brand new task (e.g. spawned because a client just
+    reconnected to a match that finished long ago) whose very FIRST check
+    already finds "completed"/"cancelled" never actually witnessed a
+    transition -- it's simply discovering old news. Pushing match_finished/
+    match_cancelled in that case made every such reconnect replay the
+    original completion's client-side side effects (forfeit/win toast,
+    navigate-to-results) a second time. StateSyncEvent, sent separately
+    right after connect, already tells a fresh connection the outcome
+    without re-triggering those.
     """
     previous_status: str | None = None
     previous_question_index: int | None = None
     try:
-        while not stop_event.is_set():
+        while True:
             async with AsyncSessionLocal() as db:
                 match = await battle_gameplay_service.get_match_row(db, match_id)
                 if match is None:
@@ -227,12 +251,32 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
                 current_status = match.status
 
                 if current_status == "completed":
-                    event = await battle_ws_events.match_finished_event(db, match)
-                    await ws_manager.push_local(match_id, event)
+                    # previous_status is only ever None on this task's very
+                    # first tick -- reaching "completed" without having first
+                    # observed the match non-terminal means it was ALREADY
+                    # over before this task (hence this connection) even
+                    # started, e.g. a client reconnecting to a long-finished
+                    # match. StateSyncEvent (sent separately, right after
+                    # connect) already tells this new connection the outcome
+                    # -- re-pushing match_finished here too would make the
+                    # client replay its "just now completed" side effects
+                    # (the forfeit/win toast, the navigate-to-results effect)
+                    # for a result it's only just learning about, not one
+                    # that just happened.
+                    if previous_status is not None:
+                        event = await battle_ws_events.match_finished_event(db, match)
+                        await ws_manager.push_local(match_id, event)
                     return
 
                 if current_status == "cancelled":
-                    await ws_manager.push_local(match_id, battle_ws_events.match_cancelled_event(match))
+                    if previous_status is not None:
+                        await ws_manager.push_local(match_id, battle_ws_events.match_cancelled_event(match))
+                    return
+
+                if stop_event.is_set():
+                    # Still active/countdown/waiting even after the check
+                    # above -- a genuine early exit (last connection closed
+                    # mid-match), not a missed finalize. Safe to stop.
                     return
 
                 if current_status == "active":
@@ -276,7 +320,10 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
                 previous_status = current_status
 
             if await _sleep_or_stop(stop_event, sleep_seconds):
-                return
+                # Stop requested mid-sleep -- loop back for exactly one more
+                # _ensure_match_progressed pass (see docstring) before the
+                # `stop_event.is_set()` check above actually honors it.
+                continue
     except Exception:
         logger.exception("Battle match %d: progression timer failed.", match_id)
 
@@ -423,6 +470,15 @@ async def battle_match_ws(
 
 
 async def _notify_disconnect(*, match_id: int, user_id: int, redis: Redis, generation: int) -> None:
+    # Debounce first: a same-device reconnect (e.g. queue.tsx's socket
+    # closing right as match-session.tsx's opens a fresh one for the same
+    # match) routinely lands within a second or two of this socket closing.
+    # Sleeping here before doing anything else gives that reconnect time to
+    # call bump_connection_generation first, so the generation check inside
+    # mark_disconnected below correctly recognizes this notification as
+    # stale and no-ops -- see BATTLE_DISCONNECT_NOTICE_DEBOUNCE_SECONDS.
+    await asyncio.sleep(settings.BATTLE_DISCONNECT_NOTICE_DEBOUNCE_SECONDS)
+
     async with AsyncSessionLocal() as db:
         match = await battle_gameplay_service.get_match_row(db, match_id)
     if match is None or match.status in _TERMINAL_STATUSES:

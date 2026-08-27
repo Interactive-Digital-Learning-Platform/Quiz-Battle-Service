@@ -208,9 +208,11 @@ async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis
     # source of truth for which band this match is in.
     distribution = battle_difficulty.BATTLE_DIFFICULTY_DISTRIBUTION[match.difficulty]
     tier_counts = battle_difficulty.allocate_question_counts(distribution, settings.BATTLE_QUESTION_COUNT)
+    participants = await _get_participants(db, match.id)
     try:
         questions = await select_battle_questions(
             db, subject=match.subject, tier_counts=tier_counts,
+            participant_user_ids=(participants[0].user_id, participants[1].user_id),
         )
     except BattleQuestionSelectionError:
         # AI Failure Handling: cancel cleanly, no rating changes, no

@@ -2,21 +2,31 @@
 app/services/battle_question_service.py
 ─────────────────────────────────────────
 Shared question selection for a 1v1 battle -- BOTH players get the IDENTICAL
-question set (fairness comes from sameness, not per-player novelty), so this
-deliberately does NOT do per-user "already seen" exclusion the way
-Personalized-Quiz-Service's own quiz generation does. Uses
-groq_service.generate_questions() (bare call, no per-user args),
-text_similarity.is_near_duplicate (pure text similarity), and
+question set (fairness comes from sameness). Questions are drawn from
+whatever lessons naturally turn up within the subject (no single-lesson
+lock -- a match's 10 questions can and should span multiple lessons), but
+exclude any question either player has already faced in a PREVIOUS battle
+for this subject (via BattleAnswer -- see select_battle_questions), so this
+is no longer flat "any question in the subject" selection with zero novelty
+guarantee. Uses groq_service.generate_questions() (bare call, no per-user or
+lesson-pinning args -- it picks its own lesson per question, same as
+before), text_similarity.is_near_duplicate (pure text similarity), and
 call_budget.CallBudget (pure counter dataclass) -- all copied from
 Personalized-Quiz-Service's quiz_service.py, see those modules for
 implementations.
+
+Deliberately does NOT reach into Personalized-Quiz-Service's single-player
+attempt history (QuestionAttempt/QuizSession) -- that's a separate service
+not modeled here at all (see app/models/question.py's own note on this).
+"Already seen" here means "already answered in a previous BATTLE", not
+"ever seen anywhere by this user".
 
 Selection is split across difficulty tiers (see app/services/
 battle_difficulty.py) rather than one flat difficulty for the whole match --
 `tier_counts` (already-allocated exact integer counts per tier) drives one
 pool-first/Groq-shortfall/blind-topup pass PER TIER, sharing one
 exclude_ids/exclude_texts accumulator across all of them so nothing repeats
-or near-duplicates across tiers either.
+or near-duplicates across tiers, or across the two players' battle history.
 """
 import logging
 import random
@@ -27,6 +37,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.battle_match import BattleAnswer
 from app.models.question import Question
 from app.services import telemetry_service
 from app.services.call_budget import CallBudget
@@ -48,10 +59,14 @@ async def _fetch_battle_pool_questions(
     exclude_ids: set[int], exclude_texts: list[str],
 ) -> list[Question]:
     """Mirrors quiz_service._fetch_pool_questions's shape (random sample, 3x
-    over-fetch, near-duplicate accept-loop) WITHOUT the already_seen_by_user
-    subquery. Does NOT trigger quiz_service's pool-replenish background task
-    -- that's quiz_service's own concern for the single-player pool; a
-    second independent trigger path here would risk redundant top-ups.
+    over-fetch, near-duplicate accept-loop), drawing from ANY lesson within
+    the subject -- exclude_ids already covers both cross-tier repeats within
+    this match AND either player's battle history for this subject (seeded
+    by the caller, select_battle_questions), so this stays a single, uniform
+    exclusion set regardless of where an ID came from. Does NOT trigger
+    quiz_service's pool-replenish background task -- that's quiz_service's
+    own concern for the single-player pool; a second independent trigger
+    path here would risk redundant top-ups.
     """
     if limit <= 0:
         return []
@@ -78,12 +93,16 @@ async def _select_for_one_tier(
 ) -> tuple[list[Question], dict]:
     """Pool-first, Groq-for-the-shortfall (up to BATTLE_QUESTION_GROQ_MAX_
     CALLS calls, same dedup-retry shape as quiz_service._generate_or_cache_
-    tier), blind-pool-topup-as-last-resort -- for ONE difficulty tier.
-    exclude_ids/exclude_texts are shared mutable accumulators threaded
-    across every tier of one match, so a question never repeats (or
-    near-duplicates) across tiers either, not just within one. Returns the
-    tier's questions (possibly short -- caller decides whether that's fatal)
-    plus per-tier stats for the caller's aggregated telemetry event.
+    tier), blind-pool-topup-as-last-resort -- for ONE difficulty tier, drawn
+    from any lesson within the subject. exclude_ids/exclude_texts are shared
+    mutable accumulators threaded across every tier of one match, so a
+    question never repeats (or near-duplicates) across tiers either, not
+    just within one -- the caller (select_battle_questions) also seeds these
+    with both players' battle history for this subject before the tier loop
+    starts, so that history is honored here for free with no extra logic.
+    Returns the tier's questions (possibly short -- caller decides whether
+    that's fatal) plus per-tier stats for the caller's aggregated telemetry
+    event.
     """
     stats = {"generated_count": 0, "duplicate_count": 0, "groq_calls": 0,
               "invalid_question_count": 0, "error_category": None}
@@ -146,12 +165,44 @@ async def _select_for_one_tier(
     return questions, stats
 
 
+async def _seen_question_ids_and_texts(
+    db: AsyncSession, *, subject: str, participant_user_ids: tuple[int, int],
+) -> tuple[set[int], list[str]]:
+    """Every question either player has already answered in a PREVIOUS
+    battle for this subject, across ALL lessons -- the "never repeat" source
+    of truth. BattleAnswer already carries user_id directly (no join needed
+    to reach it, unlike single-player's QuestionAttempt->QuizSession chain).
+    Returns both IDs (for the notin_ pool filter) and texts (for the
+    near-duplicate check, so an AI-generated rewording of a seen question
+    gets caught too, not just an exact-ID repeat).
+    """
+    rows = (
+        await db.execute(
+            select(Question.id, Question.question)
+            .join(BattleAnswer, BattleAnswer.question_id == Question.id)
+            .where(
+                BattleAnswer.user_id.in_(participant_user_ids),
+                Question.subject == subject,
+            )
+            .distinct()
+        )
+    ).all()
+    return {row[0] for row in rows}, [row[1] for row in rows]
+
+
 async def select_battle_questions(
     db: AsyncSession, *, subject: str, tier_counts: dict[str, int],
+    participant_user_ids: tuple[int, int],
 ) -> list[Question]:
     """Selects BATTLE_QUESTION_COUNT questions split across difficulty
     tiers per `tier_counts` (see app/services/battle_difficulty.py's
-    get_difficulty_distribution/allocate_question_counts). Raises
+    get_difficulty_distribution/allocate_question_counts), drawn from
+    whatever lessons within the subject naturally turn up (no single-lesson
+    lock -- questions can and should span multiple lessons) and excluding
+    any question either of `participant_user_ids` has already faced in a
+    previous battle for this subject (see _seen_question_ids_and_texts) --
+    both players still get the identical set (fairness from sameness), it's
+    just a set neither of them has seen before. Raises
     BattleQuestionSelectionError if ANY tier is still short after all three
     phases (pool / Groq / blind topup) -- caller cancels the whole match,
     never starts it partially filled. AI-created Question rows get
@@ -168,8 +219,10 @@ async def select_battle_questions(
     tier and source (pool vs. freshly-generated) never correlate with its
     position in the match.
     """
-    exclude_ids: set[int] = set()
-    exclude_texts: list[str] = []
+    exclude_ids, exclude_texts = await _seen_question_ids_and_texts(
+        db, subject=subject, participant_user_ids=participant_user_ids,
+    )
+
     questions: list[Question] = []
     total_requested = sum(tier_counts.values())
 

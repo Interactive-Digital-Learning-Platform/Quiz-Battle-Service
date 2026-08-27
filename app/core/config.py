@@ -146,6 +146,17 @@ class Settings(BaseSettings):
     # outlives the deadline it encodes long enough for a late grace-check
     # task to still read it.
     BATTLE_DISCONNECT_MARKER_BUFFER_SECONDS: float = 10.0
+    # A client's socket for a match legitimately closes and reopens as a
+    # brand-new connection during normal navigation -- e.g. queue.tsx's
+    # socket closes and match-session.tsx's opens fresh a beat later once
+    # both players ready up, well before the reopened one has a chance to
+    # bump the connection generation. Without this delay, _notify_disconnect
+    # (battle_ws.py) would win that race almost every time and publish a
+    # spurious player_disconnected/player_reconnected pair to the OPPONENT
+    # for a socket swap that was never a real drop. Waiting this long before
+    # even checking the generation gives a same-device reconnect time to
+    # land and supersede it first.
+    BATTLE_DISCONNECT_NOTICE_DEBOUNCE_SECONDS: float = 3.0
     # How often a connected client's progression timer polls while a match
     # is still "waiting" for both sides to ready up.
     BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS: float = 1.0

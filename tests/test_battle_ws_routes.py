@@ -149,7 +149,12 @@ class WsEnv:
 
 
 @pytest.fixture
-def ws_env(tmp_path):
+def ws_env(tmp_path, monkeypatch):
+    # Zeroed by default so every test that isn't specifically about the
+    # debounce itself still sees player_disconnected/player_reconnected land
+    # immediately -- see test_quick_reconnect_within_debounce_window_is_silent
+    # below for the one test that sets this back to a real, nonzero value.
+    monkeypatch.setattr(settings, "BATTLE_DISCONNECT_NOTICE_DEBOUNCE_SECONDS", 0.0)
     db_path = tmp_path / "battle_ws_test.db"
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{db_path}", connect_args={"check_same_thread": False}, poolclass=NullPool,
@@ -437,6 +442,49 @@ def test_reconnect_within_grace_period_restores_state_and_notifies_opponent(ws_e
     assert restored_state["status"] == "active"
     assert restored_state["question_index"] == 0
     assert restored_state["question"] is not None
+
+
+def test_quick_reconnect_within_debounce_window_is_silent(ws_env, monkeypatch):
+    # Regression for the spurious "Opponent disconnected/reconnected" toast
+    # pair a player would see for the OTHER player's perfectly normal
+    # queue.tsx -> match-session.tsx screen transition: that swap closes one
+    # socket and opens a brand new one for the same match a beat later, which
+    # _notify_disconnect couldn't previously tell apart from a real drop.
+    # ws_env's own fixture zeroes BATTLE_DISCONNECT_NOTICE_DEBOUNCE_SECONDS by
+    # default (see its own comment) -- this test is the one place that needs
+    # it to actually be nonzero, to prove the debounce itself works.
+    monkeypatch.setattr(settings, "BATTLE_DISCONNECT_NOTICE_DEBOUNCE_SECONDS", 0.3)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
+        ws_a.receive_json()
+        ws_a.receive_json()
+        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+            ws_b.receive_json()
+            ws_b.receive_json()
+
+            ws_a.close()
+            # A reconnects almost immediately, well before the debounce
+            # window (re)checks whether this notification is still current.
+            with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a2:
+                connected_a2 = ws_a2.receive_json()
+                sync_a2 = ws_a2.receive_json()
+                assert connected_a2["type"] == "connected"
+                assert sync_a2["type"] == "state_sync"
+
+                # Outlive the debounce window so the original close's delayed
+                # _notify_disconnect task actually runs its generation check.
+                time.sleep(0.5)
+
+                # If a spurious player_disconnected/player_reconnected pair
+                # had been published, it would be queued ahead of this on
+                # both sockets -- the very next message each receives must be
+                # the ready broadcast, not a stray disconnect/reconnect event.
+                ws_b.send_json({"type": "ready"})
+                ready_b = ws_b.receive_json()
+                ready_a2 = ws_a2.receive_json()
+
+    assert ready_b == {"type": "player_ready", "user_id": ws_env.user_b_id}
+    assert ready_a2 == {"type": "player_ready", "user_id": ws_env.user_b_id}
 
 
 def test_socket_closed_mid_handshake_by_terminal_sweep_does_not_crash(ws_env):
