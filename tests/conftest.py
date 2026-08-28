@@ -32,9 +32,21 @@ from app.core.database import Base, get_db
 from app.core.redis_client import get_redis
 from app.core.security import get_current_user
 from app.main import app
-from app.services import battle_gameplay_service, matchmaking_service
+from app.services import battle_gameplay_service, battle_question_service, matchmaking_service
 
 TEST_CLERK_ID = "test-user"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pool_replenish(monkeypatch):
+    # battle_question_service._kickoff_pool_replenish spawns a fire-and-
+    # forget asyncio.create_task() that opens its OWN DB session via
+    # AsyncSessionLocal (bound to settings.DATABASE_URL) -- never the
+    # per-test isolated in-memory SQLite engine `db_session` sets up. Left
+    # unpatched, it would either hit the wrong database or run after the
+    # test's event loop/session has already torn down. Tests that want to
+    # assert replenish-triggering behavior patch this back themselves.
+    monkeypatch.setattr(battle_question_service, "_kickoff_pool_replenish", lambda *a, **k: None)
 
 
 @pytest.fixture(autouse=True)

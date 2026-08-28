@@ -7,6 +7,7 @@ from app.schemas.battle import (
     BattleMatchStateResponse,
     BattleParticipantResult,
     BattleQuestionPublic,
+    ParticipantQuestionResult,
     SubmitBattleAnswerResponse,
 )
 
@@ -69,8 +70,18 @@ class CountdownStartedEvent(BaseModel):
 
 
 class MatchStartedEvent(BaseModel):
+    # Carries subject/difficulty/question_count directly rather than making
+    # clients backfill them via a separate REST fetch -- that fetch raced
+    # this exact transition (it could resolve while the match was still
+    # "countdown" server-side, which never had question_count to return),
+    # leaving question_count permanently unset for the rest of the match on
+    # fast connections. Every connected client receives this event exactly
+    # once, right as status flips to "active", regardless of when it joined.
     type: Literal["match_started"] = "match_started"
     started_at: datetime
+    subject: str
+    difficulty: str
+    question_count: int
 
 
 class QuestionStartedEvent(BaseModel):
@@ -85,34 +96,36 @@ class QuestionStartedEvent(BaseModel):
 
 
 class AnswerAcknowledgedEvent(BaseModel):
+    # Grading is deferred to the reveal boundary now (see
+    # QuestionResultEvent below) -- this is just a lightweight "your
+    # (re)submission was accepted" ack, used by the client to clear its
+    # per-question in-flight submit guard. Never reveals correctness.
     type: Literal["answer_acknowledged"] = "answer_acknowledged"
-    # Correlates this ack with the specific question it answered — needed
-    # now that answers can be submitted for any question in any order
-    # (self-paced play), used by the client to clear its per-question
-    # in-flight submit guard.
     question_id: int
-    is_correct: bool
-    base_score: int
-    speed_bonus: int
-    streak_bonus: int
-    total_question_score: int
-    response_time_ms: int
+    selected_option: str
 
     @classmethod
     def from_response(cls, response: SubmitBattleAnswerResponse) -> "AnswerAcknowledgedEvent":
         return cls(**response.model_dump())
 
 
-class OpponentAnsweredEvent(BaseModel):
-    type: Literal["opponent_answered"] = "opponent_answered"
-    user_id: int
-    answered_count: int
-    # Which question slot this was for and whether it was correct -- drives
-    # the opponent's live progress-bar segment on the viewer's screen. Never
-    # includes selected_option (spec's "don't leak correct_answer" still
-    # holds; is_correct alone doesn't reveal which option was right).
+class QuestionResultEvent(BaseModel):
+    # Pushed once per question, at the reveal boundary (last
+    # BATTLE_ANSWER_REVEAL_SECONDS of its window) -- see
+    # battle_gameplay_service._grade_and_reveal_question. Both players
+    # receive the SAME event (results for both participants), simultaneously,
+    # regardless of who answered first/last/at all -- replaces the old
+    # instant-per-submission answer_acknowledged (grading)/opponent_answered
+    # pair entirely.
+    type: Literal["question_result"] = "question_result"
     question_order: int
-    is_correct: bool
+    results: list[ParticipantQuestionResult]
+    # Safe to reveal now -- the question is already locked/graded by the
+    # time this event is built, unlike BattleQuestionPublic (which never
+    # carries it, per "Do Not Send Correct Answers Early"). Same value for
+    # both participants, so it lives here rather than duplicated per-entry
+    # in `results`.
+    correct_answer: str | None
 
 
 class PlayerDisconnectedEvent(BaseModel):

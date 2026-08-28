@@ -48,12 +48,12 @@ excludes `users`/`questions` from autogenerate diffing entirely.
 A few small, pure or near-pure pieces of logic are duplicated here rather
 than imported cross-repo (there's no shared package boundary between two
 independent sibling repos): `app/services/text_similarity.py`
-(near-duplicate question detection), `app/services/call_budget.py` (shared
-Groq-call budget across a dedup-retry loop), `app/services/user_service.py`
+(near-duplicate question detection), `app/services/user_service.py`
 (`get_or_create_user`), `app/services/question_fingerprint.py`, and
-`app/services/groq_service.py` (own Groq client/retry logic — this service
-generates its own AI questions to top up the shared pool when it runs
-short). Keep these in sync by hand if the upstream logic changes.
+`app/services/groq_service.py` (own Groq client/retry logic — used only by
+`battle_question_service.py`'s background pool-replenish task, never in the
+live match-activation path; see that module's docstring). Keep these in
+sync by hand if the upstream logic changes.
 
 ### Battle lifecycle
 

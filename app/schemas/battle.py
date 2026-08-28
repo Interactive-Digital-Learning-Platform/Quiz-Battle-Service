@@ -96,6 +96,11 @@ class BattleParticipantProgress(BaseModel):
 
 class BattleParticipantResult(BaseModel):
     user_id: int
+    # Left None for "me" everywhere (the client already knows its own name
+    # locally) -- only ever populated for the other participant, so the
+    # client can show a real name instead of a generic "Opponent" label.
+    # See battle_gameplay_service.participant_result_payload.
+    username: str | None = None
     correct_count: int | None
     wrong_count: int | None
     final_score: int | None
@@ -118,12 +123,33 @@ class BattleMatchResult(BaseModel):
 
 class BattleAnswerProgress(BaseModel):
     # One question slot's outcome for a participant's progress bar -- drives
-    # BOTH players' bars (own answers AND, live over WS via
-    # OpponentAnsweredEvent / on load via this same shape, the opponent's).
-    # Absence of an entry for a question_order that's already in the past
-    # means that participant never answered it before its window closed.
+    # BOTH players' bars (own answers AND, live over WS via the
+    # question_result event / on load via this same shape, the opponent's).
+    # Every GRADED question slot gets an entry now (deferred-grading design
+    # -- see battle_gameplay_service._grade_one_participant), including ones
+    # this participant never actually submitted anything for -- `answered`
+    # is what distinguishes "answered wrong" (is_correct=False, answered=True)
+    # from "never answered at all" (is_correct=False, answered=False) for the
+    # progress bar's yellow-vs-red segment coloring. Absence of an entry
+    # entirely just means this question slot hasn't been graded/reached yet.
     question_order: int
     is_correct: bool
+    answered: bool
+
+
+class ParticipantQuestionResult(BaseModel):
+    # One participant's graded outcome for one question, revealed to BOTH
+    # players simultaneously at the reveal boundary -- see
+    # battle_gameplay_service._grade_and_reveal_question. Deliberately never
+    # includes selected_option -- preserves the existing "never leak the
+    # specific answer to the opponent" rule; only correctness is shared.
+    user_id: int
+    answered: bool
+    is_correct: bool
+    base_score: int
+    speed_bonus: int
+    streak_bonus: int
+    total_question_score: int
 
 
 class BattleMatchStateResponse(BaseModel):
@@ -145,10 +171,21 @@ class BattleMatchStateResponse(BaseModel):
     question: BattleQuestionPublic | None = None
     has_answered_current_question: bool | None = None
     # Every question slot answered so far by each side, for progress-bar
-    # hydration on initial load/reconnect (kept live afterward via
-    # answer_acknowledged/opponent_answered WS events).
+    # hydration on initial load/reconnect (kept live afterward via the
+    # question_result WS event once each question locks).
     my_answers: list[BattleAnswerProgress] | None = None
     opponent_answers: list[BattleAnswerProgress] | None = None
+    # Populated only once the CURRENT question has locked/been graded (see
+    # battle_gameplay_service._grade_and_reveal_question) -- None means it's
+    # still answerable. Lets a reconnecting client immediately show the
+    # locked/revealed state instead of a live answering UI for a question
+    # that already finished grading while it was disconnected.
+    current_question_results: list[ParticipantQuestionResult] | None = None
+    # Paired with current_question_results -- populated under the same
+    # condition (question already locked/graded), None while still
+    # answerable. See BattleQuestionPublic for why `question` itself never
+    # carries this.
+    current_question_correct_answer: str | None = None
     my_progress: BattleParticipantProgress | None = None
     opponent_progress: BattleParticipantProgress | None = None
     started_at: datetime | None = None
@@ -184,13 +221,11 @@ class SubmitBattleAnswerRequest(BaseModel):
 
 
 class SubmitBattleAnswerResponse(BaseModel):
-    # Included so the client can correlate this ack with the specific
-    # question it answered -- needed now that answers can be submitted for
-    # any question in any order (self-paced play), not just "the current one".
+    # Deliberately minimal -- grading is deferred to the reveal boundary
+    # (see battle_gameplay_service._grade_and_reveal_question /
+    # QuestionResultEvent below), so submitting an answer no longer reveals
+    # correctness. This is just an ack that the (re)submission was accepted;
+    # question_id lets the client correlate it since answers can be changed
+    # freely (resubmitted) any number of times before the question locks.
     question_id: int
-    is_correct: bool
-    base_score: int
-    speed_bonus: int
-    streak_bonus: int
-    total_question_score: int
-    response_time_ms: int
+    selected_option: str

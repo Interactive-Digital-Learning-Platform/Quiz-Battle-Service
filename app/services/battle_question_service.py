@@ -8,12 +8,21 @@ lock -- a match's 10 questions can and should span multiple lessons), but
 exclude any question either player has already faced in a PREVIOUS battle
 for this subject (via BattleAnswer -- see select_battle_questions), so this
 is no longer flat "any question in the subject" selection with zero novelty
-guarantee. Uses groq_service.generate_questions() (bare call, no per-user or
-lesson-pinning args -- it picks its own lesson per question, same as
-before), text_similarity.is_near_duplicate (pure text similarity), and
-call_budget.CallBudget (pure counter dataclass) -- all copied from
-Personalized-Quiz-Service's quiz_service.py, see those modules for
-implementations.
+guarantee.
+
+Match activation NEVER calls Groq live -- it only ever reads the DB pool
+(see _select_for_one_tier), so a slow, rate-limited, or down Groq can no
+longer stall or fail a match start, and question selection is a fast,
+local-only DB read. Keeping each (subject, difficulty) pool stocked is
+instead a background concern: _fetch_battle_pool_questions triggers a
+debounced, fire-and-forget top-up (_kickoff_pool_replenish/
+_replenish_pool_task) whenever a bucket reads low, mirroring
+Personalized-Quiz-Service's quiz_service.py pool-replenish pattern (that's
+where generate_questions()/is_near_duplicate() are actually still used from
+this module). If even the never-seen pool for a tier is too thin (a cold
+bucket that hasn't been topped up yet), already-answered questions are
+allowed back in as a last resort rather than cancelling the match outright
+-- see _select_for_one_tier's docstring.
 
 Deliberately does NOT reach into Personalized-Quiz-Service's single-player
 attempt history (QuestionAttempt/QuizSession) -- that's a separate service
@@ -24,23 +33,22 @@ not modeled here at all (see app/models/question.py's own note on this).
 Selection is split across difficulty tiers (see app/services/
 battle_difficulty.py) rather than one flat difficulty for the whole match --
 `tier_counts` (already-allocated exact integer counts per tier) drives one
-pool-first/Groq-shortfall/blind-topup pass PER TIER, sharing one
-exclude_ids/exclude_texts accumulator across all of them so nothing repeats
-or near-duplicates across tiers, or across the two players' battle history.
+never-seen-pool/repeat-as-last-resort pass PER TIER, sharing one running
+"session" accumulator (questions already picked this match, across every
+tier) across all of them so nothing repeats or near-duplicates across tiers.
 """
+import asyncio
 import logging
 import random
-import time
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import AsyncSessionLocal
 from app.models.battle_match import BattleAnswer
 from app.models.question import Question
-from app.services import telemetry_service
-from app.services.call_budget import CallBudget
 from app.services.groq_service import generate_questions
 from app.services.text_similarity import is_near_duplicate
 
@@ -48,25 +56,41 @@ logger = logging.getLogger(__name__)
 
 
 class BattleQuestionSelectionError(Exception):
-    """Raised when neither the DB pool nor Groq can supply enough shared
-    battle questions -- the caller (battle_gameplay_service) must cancel
-    the match cleanly, never partially start it with too few questions.
+    """Raised when the DB pool (never-seen, then repeats-as-last-resort)
+    can't supply enough shared battle questions -- the caller
+    (battle_gameplay_service) must cancel the match cleanly, never
+    partially start it with too few questions.
     """
+
+
+# Buckets currently being topped up in the background, keyed by
+# (subject, difficulty) -- an in-process debounce so several concurrent
+# matches hitting the same low bucket don't each spawn their own top-up
+# task. A duplicate top-up across worker processes would just be a wasted
+# Groq call, never a correctness problem, so no cross-process lock (same
+# reasoning as quiz_service's own _replenishing_buckets).
+_replenishing_buckets: set[tuple[str, str]] = set()
 
 
 async def _fetch_battle_pool_questions(
     db: AsyncSession, *, subject: str, difficulty: str, limit: int,
-    exclude_ids: set[int], exclude_texts: list[str],
+    exclude_ids: set[int], history_texts: list[str], session_texts: list[str],
 ) -> list[Question]:
     """Mirrors quiz_service._fetch_pool_questions's shape (random sample, 3x
     over-fetch, near-duplicate accept-loop), drawing from ANY lesson within
-    the subject -- exclude_ids already covers both cross-tier repeats within
-    this match AND either player's battle history for this subject (seeded
-    by the caller, select_battle_questions), so this stays a single, uniform
-    exclusion set regardless of where an ID came from. Does NOT trigger
-    quiz_service's pool-replenish background task -- that's quiz_service's
-    own concern for the single-player pool; a second independent trigger
-    path here would risk redundant top-ups.
+    the subject. `exclude_ids` is whatever the caller wants filtered out via
+    SQL (varies by phase -- see _select_for_one_tier). Near-duplicate
+    checking is against `history_texts` (either player's PREVIOUS battle
+    answers for this subject -- static, never mutated here) PLUS
+    `session_texts` (this match's own picks so far, across every tier --
+    mutated in place as candidates are accepted, so it keeps growing across
+    calls). Passing an empty `history_texts` is how the caller allows
+    already-seen questions back in as a last resort while still preventing
+    a question from repeating within THIS match.
+
+    Also triggers a debounced, fire-and-forget background top-up (see
+    _kickoff_pool_replenish) whenever this (subject, difficulty) bucket is
+    running low -- never blocks this read on that.
     """
     if limit <= 0:
         return []
@@ -76,93 +100,156 @@ async def _fetch_battle_pool_questions(
     stmt = select(Question).where(*filters).order_by(func.random()).limit(limit * 3)
     candidates = list((await db.execute(stmt)).scalars().all())
 
+    dedup_pool = list(history_texts) + list(session_texts)
     accepted: list[Question] = []
     for candidate in candidates:
         if len(accepted) >= limit:
             break
-        if is_near_duplicate(candidate.question, exclude_texts):
+        if is_near_duplicate(candidate.question, dedup_pool):
             continue
         accepted.append(candidate)
-        exclude_texts.append(candidate.question)
+        dedup_pool.append(candidate.question)
+        session_texts.append(candidate.question)
+
+    bucket_size_stmt = (
+        select(func.count())
+        .select_from(Question)
+        .where(Question.subject == subject, Question.difficulty == difficulty)
+    )
+    bucket_size = (await db.execute(bucket_size_stmt)).scalar() or 0
+    if bucket_size < settings.BATTLE_POOL_MIN_SIZE:
+        _kickoff_pool_replenish(subject, difficulty)
+
     return accepted
+
+
+def _kickoff_pool_replenish(subject: str, difficulty: str) -> None:
+    # A thin, easily-mockable wrapper around asyncio.create_task -- tests
+    # patch this directly so they never spawn a real background Groq call
+    # against a DB session/event loop the test has already torn down.
+    key = (subject, difficulty)
+    if key in _replenishing_buckets:
+        return
+    _replenishing_buckets.add(key)
+    asyncio.create_task(_replenish_pool_task(subject, difficulty))
+
+
+async def _replenish_pool_task(subject: str, difficulty: str) -> None:
+    """Runs after the triggering match activation has already returned its
+    questions -- opens its own DB session (AsyncSessionLocal) since the
+    request-scoped session is closed by then. Never lets a failure here
+    surface anywhere; it's fully decoupled from any live match. Mirrors
+    quiz_service._replenish_pool_task exactly (no per-user/lesson pinning,
+    no dedup-against-existing-text on write -- dedup happens on READ, in
+    _fetch_battle_pool_questions, against whatever's actually in play for a
+    given match).
+    """
+    key = (subject, difficulty)
+    try:
+        async with AsyncSessionLocal() as session:
+            count_stmt = (
+                select(func.count())
+                .select_from(Question)
+                .where(Question.subject == subject, Question.difficulty == difficulty)
+            )
+            current = (await session.execute(count_stmt)).scalar() or 0
+            needed = settings.BATTLE_POOL_TARGET_SIZE - current
+            if needed <= 0:
+                return
+
+            batch_size = min(needed, settings.BATTLE_POOL_TOPUP_MAX_BATCH)
+            try:
+                batch = await generate_questions(
+                    grade=settings.BATTLE_QUESTION_GRADE_DEFAULT,
+                    subject=subject, difficulty=difficulty, question_count=batch_size,
+                )
+            except HTTPException as exc:
+                logger.warning(
+                    "Battle pool replenish failed subject=%s difficulty=%s: %s",
+                    subject, difficulty, exc.detail,
+                )
+                return
+
+            for q_data in batch:
+                session.add(Question(
+                    question=q_data["question"], options=q_data["options"],
+                    correct_answer=q_data["correct_answer"], subject=subject,
+                    lesson=q_data["lesson"], difficulty=difficulty,
+                ))
+            await session.commit()
+            logger.info(
+                "Battle pool replenished subject=%s difficulty=%s added=%d new_total=%d",
+                subject, difficulty, len(batch), current + len(batch),
+            )
+    except Exception:
+        logger.exception(
+            "Unexpected error replenishing battle pool subject=%s difficulty=%s", subject, difficulty
+        )
+    finally:
+        _replenishing_buckets.discard(key)
 
 
 async def _select_for_one_tier(
     db: AsyncSession, *, subject: str, difficulty: str, count: int,
-    exclude_ids: set[int], exclude_texts: list[str],
-) -> tuple[list[Question], dict]:
-    """Pool-first, Groq-for-the-shortfall (up to BATTLE_QUESTION_GROQ_MAX_
-    CALLS calls, same dedup-retry shape as quiz_service._generate_or_cache_
-    tier), blind-pool-topup-as-last-resort -- for ONE difficulty tier, drawn
-    from any lesson within the subject. exclude_ids/exclude_texts are shared
-    mutable accumulators threaded across every tier of one match, so a
-    question never repeats (or near-duplicates) across tiers either, not
-    just within one -- the caller (select_battle_questions) also seeds these
-    with both players' battle history for this subject before the tier loop
-    starts, so that history is honored here for free with no extra logic.
-    Returns the tier's questions (possibly short -- caller decides whether
-    that's fatal) plus per-tier stats for the caller's aggregated telemetry
-    event.
-    """
-    stats = {"generated_count": 0, "duplicate_count": 0, "groq_calls": 0,
-              "invalid_question_count": 0, "error_category": None}
+    history_ids: set[int], history_texts: list[str],
+    session_ids: set[int], session_texts: list[str],
+) -> tuple[list[Question], int]:
+    """DB-pool-only, repeats-allowed-as-a-last-resort -- for ONE difficulty
+    tier, drawn from any lesson within the subject.
 
+    `history_ids`/`history_texts` are the STATIC seed (either player's
+    PREVIOUS battle answers for this subject, from select_battle_questions'
+    _seen_question_ids_and_texts call) -- never mutated. `session_ids`/
+    `session_texts` are shared MUTABLE accumulators threaded across every
+    tier of this match, growing as questions get picked, so nothing repeats
+    or near-duplicates ACROSS tiers either, not just within one.
+
+    Two phases, in order, each only running if the previous one left a
+    shortfall:
+      1. DB pool, excluding history + session -- "never seen before"
+         honored for free.
+      2. DB pool AGAIN, but with `history_texts`/`history_ids` dropped from
+         the exclusion (passing history_texts=[] to the pool fetch, and
+         only `session_ids` -- not `history_ids` -- to the SQL filter) --
+         i.e. a previously-answered question is now allowed back in, but a
+         question already picked THIS match still isn't. This only fires
+         when phase 1 couldn't fill the tier (the never-seen pool for this
+         difficulty is too thin for this pair of players, e.g. a cold
+         bucket the background replenish hasn't caught up on yet) --
+         logged, since silently serving a repeat is a real behavior change
+         worth being visible in the logs.
+
+    Returns the tier's questions (possibly still short if even phase 2
+    couldn't cover it -- caller decides whether that's fatal) plus how many
+    of them were served as repeats, for the caller's aggregated logging.
+    """
     questions = await _fetch_battle_pool_questions(
         db, subject=subject, difficulty=difficulty, limit=count,
-        exclude_ids=exclude_ids, exclude_texts=exclude_texts,
+        exclude_ids=history_ids | session_ids,
+        history_texts=history_texts, session_texts=session_texts,
     )
-    exclude_ids.update(q.id for q in questions)
+    session_ids.update(q.id for q in questions)
 
     remaining = count - len(questions)
+    repeat_count = 0
     if remaining > 0:
-        call_budget = CallBudget(remaining=settings.BATTLE_QUESTION_GROQ_MAX_CALLS)
-        tier_telemetry: dict = {}
-        for _attempt in range(3):
-            still_needed = count - len(questions)
-            if still_needed <= 0 or not call_budget.consume():
-                break
-            stats["groq_calls"] += 1
-            try:
-                batch = await generate_questions(
-                    grade=settings.BATTLE_QUESTION_GRADE_DEFAULT,
-                    subject=subject, difficulty=difficulty,
-                    question_count=still_needed, existing_questions=exclude_texts,
-                    telemetry=tier_telemetry,
-                )
-            except HTTPException as exc:
-                logger.warning(
-                    "Battle question generation failed subject=%s difficulty=%s: %s",
-                    subject, difficulty, exc.detail,
-                )
-                stats["error_category"] = "provider_error"
-                break
-            for q_data in batch:
-                if is_near_duplicate(q_data["question"], exclude_texts):
-                    stats["duplicate_count"] += 1
-                    continue
-                question = Question(
-                    question=q_data["question"], options=q_data["options"],
-                    correct_answer=q_data["correct_answer"], subject=subject,
-                    lesson=q_data["lesson"], difficulty=difficulty,
-                )
-                db.add(question)
-                questions.append(question)
-                exclude_texts.append(q_data["question"])
-                stats["generated_count"] += 1
-        stats["invalid_question_count"] = tier_telemetry.get("invalid_question_count", 0)
-        if questions:
-            await db.flush()  # ids available for exclude_ids below
-            exclude_ids.update(q.id for q in questions if q.id is not None)
-
-    remaining = count - len(questions)
-    if remaining > 0:
-        fallback = await _fetch_battle_pool_questions(
+        repeat_questions = await _fetch_battle_pool_questions(
             db, subject=subject, difficulty=difficulty, limit=remaining,
-            exclude_ids=exclude_ids, exclude_texts=exclude_texts,
+            exclude_ids=session_ids,  # history_ids deliberately NOT excluded here
+            history_texts=[], session_texts=session_texts,
         )
-        questions.extend(fallback)
+        if repeat_questions:
+            logger.warning(
+                "Battle question selection fell back to repeat questions "
+                "subject=%s difficulty=%s count=%d (never-seen pool came up "
+                "short).",
+                subject, difficulty, len(repeat_questions),
+            )
+        questions.extend(repeat_questions)
+        session_ids.update(q.id for q in repeat_questions)
+        repeat_count = len(repeat_questions)
 
-    return questions, stats
+    return questions, repeat_count
 
 
 async def _seen_question_ids_and_texts(
@@ -173,8 +260,8 @@ async def _seen_question_ids_and_texts(
     of truth. BattleAnswer already carries user_id directly (no join needed
     to reach it, unlike single-player's QuestionAttempt->QuizSession chain).
     Returns both IDs (for the notin_ pool filter) and texts (for the
-    near-duplicate check, so an AI-generated rewording of a seen question
-    gets caught too, not just an exact-ID repeat).
+    near-duplicate check, so a pool question that's a rewording of a seen
+    question gets caught too, not just an exact-ID repeat).
     """
     rows = (
         await db.execute(
@@ -202,71 +289,58 @@ async def select_battle_questions(
     any question either of `participant_user_ids` has already faced in a
     previous battle for this subject (see _seen_question_ids_and_texts) --
     both players still get the identical set (fairness from sameness), it's
-    just a set neither of them has seen before. Raises
-    BattleQuestionSelectionError if ANY tier is still short after all three
-    phases (pool / Groq / blind topup) -- caller cancels the whole match,
-    never starts it partially filled. AI-created Question rows get
-    question_fingerprint auto-populated by the existing before_insert
-    listener (app/models/question.py) for free; no extra code needed here.
+    just a set neither of them has seen before -- UNLESS even that can't be
+    filled (the never-seen pool for a tier's difficulty is too thin), in
+    which case _select_for_one_tier's second phase allows already-answered
+    questions back in as a last resort rather than cancelling the match; see
+    its docstring. Raises BattleQuestionSelectionError only if even repeats
+    can't fill a tier -- caller cancels the whole match, never starts it
+    partially filled.
 
-    Records exactly one AIGenerationEvent row for the whole call (aggregated
-    across every tier), mirroring quiz_service.generate_quiz's
-    one-telemetry-event-per-request granularity -- see telemetry_service.py.
-    A telemetry write failure is swallowed there and can never affect
-    question selection itself.
+    Never calls Groq itself -- purely a DB read (fast, no external-API
+    latency or rate-limit risk in the match-activation critical path). Pool
+    top-ups happen out-of-band; see this module's docstring.
 
     Order of the returned list is randomized so a question's difficulty
-    tier and source (pool vs. freshly-generated) never correlate with its
+    tier and source (never-seen vs. repeat) never correlate with its
     position in the match.
     """
-    exclude_ids, exclude_texts = await _seen_question_ids_and_texts(
+    history_ids, history_texts = await _seen_question_ids_and_texts(
         db, subject=subject, participant_user_ids=participant_user_ids,
     )
+    # Grows as tiers are processed -- see _select_for_one_tier's docstring.
+    # Kept separate from history_ids/history_texts (static) so the last-
+    # resort repeat phase can drop history from the exclusion while still
+    # forbidding a question from repeating within THIS match.
+    session_ids: set[int] = set()
+    session_texts: list[str] = []
 
     questions: list[Question] = []
     total_requested = sum(tier_counts.values())
 
-    agg_generated = 0
-    agg_duplicates = 0
-    agg_calls = 0
-    agg_invalid = 0
-    agg_error_category: str | None = None
+    agg_repeats = 0
     short_tiers: list[str] = []
 
-    start = time.monotonic()
     for difficulty, count in tier_counts.items():
         if count <= 0:
             continue
-        tier_questions, stats = await _select_for_one_tier(
+        tier_questions, repeat_count = await _select_for_one_tier(
             db, subject=subject, difficulty=difficulty, count=count,
-            exclude_ids=exclude_ids, exclude_texts=exclude_texts,
+            history_ids=history_ids, history_texts=history_texts,
+            session_ids=session_ids, session_texts=session_texts,
         )
         questions.extend(tier_questions)
-        agg_generated += stats["generated_count"]
-        agg_duplicates += stats["duplicate_count"]
-        agg_calls += stats["groq_calls"]
-        agg_invalid += stats["invalid_question_count"]
-        if stats["error_category"] is not None:
-            agg_error_category = stats["error_category"]
+        agg_repeats += repeat_count
         if len(tier_questions) < count:
             short_tiers.append(difficulty)
-    latency_ms = (time.monotonic() - start) * 1000.0
 
-    success = not short_tiers
-    if not success and agg_error_category is None:
-        agg_error_category = "insufficient_pool"
-
-    try:
-        await telemetry_service.record_generation_event(
-            db, user_id=None, subject=subject,
-            requested_question_count=total_requested, generated_question_count=agg_generated,
-            provider="groq", model_name=settings.GROQ_MODEL, success=success,
-            used_cache_fallback=agg_calls == 0, retry_count=max(agg_calls - 1, 0),
-            duplicate_count=agg_duplicates, invalid_question_count=agg_invalid,
-            latency_ms=latency_ms, error_category=agg_error_category,
+    if agg_repeats:
+        logger.warning(
+            "Battle match question selection served %d repeat question(s) "
+            "subject=%s (never-seen pool came up short for at least one "
+            "tier).",
+            agg_repeats, subject,
         )
-    except Exception as telemetry_exc:  # noqa: BLE001
-        logger.error("AI generation telemetry raised unexpectedly (non-critical): %s", telemetry_exc)
 
     if short_tiers:
         raise BattleQuestionSelectionError(

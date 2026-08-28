@@ -36,10 +36,15 @@ same state transition and call push_local, which broadcasts to every local
 socket, so every client would receive each time-driven event duplicated once
 per locally-connected socket (confirmed directly: two sockets on one process
 each received `match_started` twice). connect() accepts
-an optional factory to start the timer on first local connection;
-disconnect() signals its stop_event (cooperative shutdown, matching
-_progression_timer's own requirement -- see its docstring for why raw
-task.cancel() isn't safe here) on last local disconnection.
+an optional factory to start the timer on first local connection, wrapped in
+_run_progression_timer_with_respawn -- a supervisor that restarts it if it
+ever dies from an unhandled exception (a transient DB/Redis error mid-tick),
+rather than leaving that match's question progression silently frozen for
+good, since otherwise it's only ever started once. disconnect() signals its
+stop_event (cooperative shutdown, matching _progression_timer's own
+requirement -- see its docstring for why raw task.cancel() isn't safe here)
+on last local disconnection; the supervisor treats that as a clean exit too,
+not a failure to restart from.
 """
 import asyncio
 import contextlib
@@ -51,6 +56,8 @@ from typing import Any
 
 from fastapi import WebSocket
 from redis.asyncio import Redis
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +105,36 @@ class BattleConnectionManager:
             stop_event = asyncio.Event()
             self._progression_stops[match_id] = stop_event
             self._progression_tasks[match_id] = asyncio.create_task(
-                start_progression_timer(match_id, stop_event)
+                self._run_progression_timer_with_respawn(match_id, stop_event, start_progression_timer)
             )
         return previous[0] if previous else None
+
+    async def _run_progression_timer_with_respawn(
+        self, match_id: int, stop_event: asyncio.Event, factory: ProgressionTimerFactory,
+    ) -> None:
+        """Supervises the actual progression-timer coroutine (battle_ws.py's
+        _progression_timer, which no longer swallows its own exceptions --
+        see its docstring) and restarts it if it ever dies from an
+        unhandled exception, instead of just letting the match's question
+        progression freeze forever for anyone routed to this process. A
+        CLEAN return (match finished/cancelled, not found, or stop_event
+        set) is the expected way that coroutine ends and is never
+        respawned here -- only an exception triggers a restart.
+        """
+        while True:
+            try:
+                await factory(match_id, stop_event)
+                return  # clean exit -- match resolved or shutdown requested
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if stop_event.is_set():
+                    return  # shutting down anyway -- not a failure to recover from
+                logger.exception(
+                    "Battle match %d: progression timer died unexpectedly, restarting in %.1fs.",
+                    match_id, settings.BATTLE_PROGRESSION_TIMER_RESPAWN_DELAY_SECONDS,
+                )
+                await asyncio.sleep(settings.BATTLE_PROGRESSION_TIMER_RESPAWN_DELAY_SECONDS)
 
     def disconnect(self, *, match_id: int, user_id: int, websocket: WebSocket) -> bool:
         """Deregisters a local connection. Returns False (a no-op) if this

@@ -32,6 +32,7 @@ like Phase 3's original activation CAS did; whether one or both processes
 observe "both ready" in Redis doesn't matter, only one CAS ever wins.
 """
 import asyncio
+import json
 import logging
 import math
 from datetime import UTC, datetime, timedelta
@@ -54,11 +55,12 @@ from app.models.battle_match import (
 from app.models.competitive_rating import CompetitiveSubjectRating
 from app.models.question import Question
 from app.models.user import User
+from app.schemas.battle import ParticipantQuestionResult
 from app.schemas.battle_ws import (
     CountdownStartedEvent,
     MatchCancelledEvent,
-    OpponentAnsweredEvent,
     PlayerReadyEvent,
+    QuestionResultEvent,
 )
 from app.services import battle_difficulty, elo_engine, league_engine
 from app.services.battle_connection_manager import manager as ws_manager
@@ -99,12 +101,58 @@ def _ready_key(match_id: int) -> str:
     return f"battle:ready:{match_id}"
 
 
+def _connected_key(match_id: int) -> str:
+    return f"battle:connected:{match_id}"
+
+
+def _both_ready_at_key(match_id: int) -> str:
+    return f"battle:both_ready_at:{match_id}"
+
+
 def _disconnect_deadline_key(match_id: int, user_id: int) -> str:
     return f"battle:disconnect_deadline:{match_id}:{user_id}"
 
 
 def _connection_generation_key(match_id: int, user_id: int) -> str:
     return f"battle:conn_gen:{match_id}:{user_id}"
+
+
+def _pending_answer_key(match_id: int, question_id: int, user_id: int) -> str:
+    return f"battle:pending_answer:{match_id}:{question_id}:{user_id}"
+
+
+async def _set_pending_answer(
+    redis: Redis, *, match_id: int, question_id: int, user_id: int,
+    selected_option: str, response_time_ms: int,
+) -> None:
+    """Upsert (plain SET, no history) -- while a question is still
+    answerable, players may change their mind any number of times, and each
+    (re)submission just overwrites this key. Whichever value is here when
+    _grade_and_reveal_question pops it at the reveal boundary is the "final
+    answer" for both correctness and the speed bonus -- exactly "time to
+    final answer". TTL is a safety-net only (mirrors this module's other
+    transient Redis keys) -- grading always pops the key itself once the
+    question locks; nothing else in this module depends on it expiring.
+    """
+    key = _pending_answer_key(match_id, question_id, user_id)
+    payload = json.dumps({"selected_option": selected_option, "response_time_ms": response_time_ms})
+    await redis.set(key, payload, ex=int(settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS * 2))
+
+
+async def _pop_pending_answer(
+    redis: Redis, *, match_id: int, question_id: int, user_id: int,
+) -> dict | None:
+    """Read-then-delete -- None means this player never submitted (or their
+    submission already expired/was already popped by a prior grading pass),
+    graded as "unanswered" (incorrect, 0 points) by the caller, same as a
+    missed question always has been.
+    """
+    key = _pending_answer_key(match_id, question_id, user_id)
+    raw = await redis.get(key)
+    if raw is None:
+        return None
+    await redis.delete(key)
+    return json.loads(raw)
 
 
 # ── internal lookups ─────────────────────────────────────────────────────
@@ -144,6 +192,62 @@ def _require_participant(participants: list[BattleParticipant], user_id: int) ->
 
 
 # ── ready flow (waiting -> countdown), exactly-once ──────────────────────
+#
+# Activation fires once a participant is BOTH ready (mark_ready) AND has a
+# live WS connection confirmed (mark_connected) -- whichever of the two
+# signals completes the pair LAST triggers it, via the shared
+# _try_activate_if_ready_and_connected check both call at their own tail.
+# This guards against the exact race documented on BATTLE_CONNECTION_READY_
+# TIMEOUT_SECONDS: both players tapping ready doesn't guarantee either
+# socket is actually live yet, and starting the match's clock before a
+# client is even connected to observe question 1 silently eats into its
+# answerable window. run_stale_match_reap_once force-activates a match
+# that's been ready-but-not-connected for too long -- see its docstring for
+# why that fallback (not this module) is what keeps a REST-only client (one
+# that never opens a socket, so mark_connected never fires for it) working.
+
+
+async def _try_activate_if_ready_and_connected(
+    db: AsyncSession, redis: Redis, *, match: BattleMatch, participants: list[BattleParticipant],
+) -> BattleMatch:
+    all_ids = {p.user_id for p in participants}
+    ready_ids = {int(uid) for uid in await redis.hkeys(_ready_key(match.id))}
+    if not (all_ids <= ready_ids):
+        return match
+
+    # Both ready -- record the FIRST time this becomes true (NX), so
+    # run_stale_match_reap_once can measure how long a connection
+    # confirmation has been pending from a fixed point, not from whenever it
+    # happens to next check.
+    await redis.set(
+        _both_ready_at_key(match.id), datetime.now(UTC).isoformat(),
+        nx=True, ex=settings.BATTLE_READY_TTL_SECONDS,
+    )
+
+    connected_ids = {int(uid) for uid in await redis.hkeys(_connected_key(match.id))}
+    if not (all_ids <= connected_ids):
+        return match  # ready, but still waiting on a WS connection to confirm
+
+    return await _finalize_activation(db, redis, match=match)
+
+
+async def _finalize_activation(db: AsyncSession, redis: Redis, *, match: BattleMatch) -> BattleMatch:
+    match = await _activate_countdown(db, match, redis)
+    if match.status == "countdown":
+        await ws_manager.publish(
+            redis, match_id=match.id,
+            event=CountdownStartedEvent(
+                started_at=match.started_at,
+                duration_seconds=settings.BATTLE_COUNTDOWN_DURATION_SECONDS,
+            ).model_dump(mode="json"),
+        )
+    elif match.status == "cancelled":
+        await ws_manager.publish(
+            redis, match_id=match.id,
+            event=MatchCancelledEvent(reason=match.cancel_reason).model_dump(mode="json"),
+        )
+    return match
+
 
 async def mark_ready(db: AsyncSession, redis: Redis, *, match_id: int, user_id: int) -> BattleMatch:
     match = await _get_match_or_404(db, match_id)
@@ -153,42 +257,51 @@ async def mark_ready(db: AsyncSession, redis: Redis, *, match_id: int, user_id: 
     if match.status != "waiting":
         return match  # idempotent no-op -- already past the ready-gate
 
-    other_ids = {p.user_id for p in participants} - {user_id}
     key = _ready_key(match_id)
     await redis.hset(key, str(user_id), "1")
     await redis.expire(key, settings.BATTLE_READY_TTL_SECONDS)
-    ready_ids = {int(uid) for uid in await redis.hkeys(key)}
 
     await ws_manager.publish(
         redis, match_id=match_id,
         event=PlayerReadyEvent(user_id=user_id).model_dump(mode="json"),
     )
 
-    if other_ids <= ready_ids:
-        match = await _activate_countdown(db, match, redis)
-        if match.status == "countdown":
-            await ws_manager.publish(
-                redis, match_id=match_id,
-                event=CountdownStartedEvent(
-                    started_at=match.started_at,
-                    duration_seconds=settings.BATTLE_COUNTDOWN_DURATION_SECONDS,
-                ).model_dump(mode="json"),
-            )
-        elif match.status == "cancelled":
-            await ws_manager.publish(
-                redis, match_id=match_id,
-                event=MatchCancelledEvent(reason=match.cancel_reason).model_dump(mode="json"),
-            )
-    return match
+    return await _try_activate_if_ready_and_connected(db, redis, match=match, participants=participants)
+
+
+async def mark_connected(db: AsyncSession, redis: Redis, *, match_id: int, user_id: int) -> BattleMatch | None:
+    """Records that user_id's WebSocket is live for this match -- called by
+    the WS route right after accepting the connection (see battle_ws.py).
+    A no-op (returns None) once the match is past "waiting" -- already
+    activated, or this is a routine mid-match reconnect, neither of which
+    this gate is about. See this module's ready-flow section docstring for
+    the overall design.
+    """
+    match = await get_match_row(db, match_id)
+    if match is None or match.status != "waiting":
+        return None
+
+    participants = await _get_participants(db, match_id)
+    if not any(p.user_id == user_id for p in participants):
+        return None  # not a participant -- battle_ws.py already rejects this pre-accept, defensive only
+
+    key = _connected_key(match_id)
+    await redis.hset(key, str(user_id), "1")
+    await redis.expire(key, settings.BATTLE_READY_TTL_SECONDS)
+
+    return await _try_activate_if_ready_and_connected(db, redis, match=match, participants=participants)
 
 
 async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis) -> BattleMatch:
-    now = datetime.now(UTC)
-    starts_at = now + timedelta(seconds=settings.BATTLE_COUNTDOWN_DURATION_SECONDS)
+    # started_at is deliberately NOT set here -- see below, right before the
+    # final commit, for why. This whole function runs as one open, uncommitted
+    # transaction until then, so no other reader (REST poll, another
+    # process's progression timer) can observe "countdown" with a not-yet-
+    # correct started_at in between -- nothing becomes visible until commit.
     claim_stmt = (
         update(BattleMatch)
         .where(BattleMatch.id == match.id, BattleMatch.status == "waiting")
-        .values(status="countdown", started_at=starts_at)
+        .values(status="countdown")
         .returning(BattleMatch.id)
     )
     claimed = (await db.execute(claim_stmt)).scalar_one_or_none()
@@ -200,7 +313,7 @@ async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis
         await db.refresh(match)
         return match
 
-    await db.refresh(match)  # pick up started_at this UPDATE just set (same transaction, uncommitted)
+    await db.refresh(match)  # pick up status this UPDATE just set (same transaction, uncommitted)
     # match.difficulty is already the band label get_difficulty_label()
     # produced at match-creation time (matchmaking_service._create_match) --
     # look the same band's {easy,medium,hard} split back up rather than
@@ -232,6 +345,17 @@ async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis
 
     for order, question in enumerate(questions):
         db.add(BattleMatchQuestion(match_id=match.id, question_id=question.id, question_order=order))
+    # Anchor the whole match's question-timing clock to NOW -- i.e. AFTER
+    # select_battle_questions has already finished, however long that took
+    # (AI generation can genuinely run several real seconds, especially
+    # under Groq rate-limiting/retries) -- not to a timestamp captured
+    # before that potentially-slow work ran. Nothing outside this function
+    # can observe "countdown" before this same commit anyway (single open
+    # transaction throughout), so there's no earlier, briefly-wrong value
+    # for anyone to have raced on. Getting this wrong silently deducted
+    # selection's own latency from question 1's 30s window before either
+    # player had even been told the match was starting.
+    match.started_at = datetime.now(UTC) + timedelta(seconds=settings.BATTLE_COUNTDOWN_DURATION_SECONDS)
     await db.commit()
     await db.refresh(match)
     logger.info(
@@ -327,11 +451,18 @@ def _apply_result(
     behave exactly like a normal loss while the stored result still
     distinguishes "lost by forfeit" from "lost by playing worse."
     """
-    answered_count = len(answers)
+    # `answers` now includes a row for every GRADED question slot, even ones
+    # this player never actually submitted anything for (deferred-grading
+    # design -- see _grade_one_participant, selected_option=="" sentinel) --
+    # filter those back out here so a timeout doesn't inflate wrong_count or
+    # get counted toward average response time, preserving the original
+    # "a missed question simply isn't counted as answered at all" semantics.
+    submitted_answers = [a for a in answers if a.selected_option]
+    answered_count = len(submitted_answers)
     # ALL answered questions count toward average response time (not just
     # correct ones) -- matches how QuestionAttempt.response_time is tracked
     # elsewhere regardless of correctness.
-    total_response_time_s = sum(a.response_time_ms for a in answers) / 1000.0
+    total_response_time_s = sum(a.response_time_ms for a in submitted_answers) / 1000.0
 
     # Running (cumulative) average: new_avg = (old_avg*old_count + new_sum) / (old_count+new_count).
     old_count = rating.total_answers
@@ -667,16 +798,21 @@ async def question_payload_for(db: AsyncSession, match: BattleMatch, order: int)
 
 
 async def _progress_answers(db: AsyncSession, *, match_id: int, user_id: int) -> list[dict]:
-    """Every question slot this player has answered so far, as
-    {question_order, is_correct} ordered by question_order -- feeds both
-    players' progress bars (own answers directly, opponent's the same shape
-    seeded on load then kept live via OpponentAnsweredEvent). A question
-    slot with no entry here that's already in the past means this player
-    never answered it before its window closed.
+    """Every question slot GRADED so far for this player, as {question_order,
+    is_correct, answered} ordered by question_order -- feeds both players'
+    progress bars (own answers directly, opponent's the same shape seeded on
+    load then kept live via the question_result WS event). Deferred-grading
+    design: a BattleAnswer row exists for every graded slot regardless of
+    whether this player actually submitted anything (see
+    _grade_one_participant, selected_option=="" sentinel for "never
+    answered") -- `answered` is what the progress bar uses to tell "answered
+    wrong" from "never answered at all" apart, since both grade is_correct=
+    False. A question slot with no entry here at all just hasn't been
+    graded/reached yet.
     """
     rows = (
         await db.execute(
-            select(BattleMatchQuestion.question_order, BattleAnswer.is_correct)
+            select(BattleMatchQuestion.question_order, BattleAnswer.is_correct, BattleAnswer.selected_option)
             .join(
                 BattleAnswer,
                 (BattleAnswer.match_id == BattleMatchQuestion.match_id)
@@ -687,17 +823,25 @@ async def _progress_answers(db: AsyncSession, *, match_id: int, user_id: int) ->
             .order_by(BattleMatchQuestion.question_order.asc())
         )
     ).all()
-    return [{"question_order": order, "is_correct": is_correct} for order, is_correct in rows]
+    return [
+        {"question_order": order, "is_correct": is_correct, "answered": bool(selected_option)}
+        for order, is_correct, selected_option in rows
+    ]
 
 
-def participant_result_payload(p: BattleParticipant) -> dict:
+def participant_result_payload(p: BattleParticipant, *, username: str | None = None) -> dict:
     """Shared by _build_completed_state, get_battle_history, and
     battle_ws_events.match_finished_event. `rating_delta` is the wire name
     for the stored `rating_change` column (kept distinct so existing mobile
-    clients reading `rating_delta` are unaffected).
+    clients reading `rating_delta` are unaffected). `username` is left None
+    for "me" everywhere -- callers already know their own name locally
+    (Clerk/profile) -- and is only ever looked up and passed for the
+    opponent side, so the client can show a real name instead of a generic
+    "Opponent" placeholder.
     """
     return {
-        "user_id": p.user_id, "correct_count": p.correct_count, "wrong_count": p.wrong_count,
+        "user_id": p.user_id, "username": username,
+        "correct_count": p.correct_count, "wrong_count": p.wrong_count,
         "final_score": p.final_score, "best_streak": p.best_streak,
         "total_response_time_ms": p.total_response_time_ms,
         "rating_before": p.rating_before, "rating_after": p.rating_after,
@@ -780,7 +924,10 @@ async def get_battle_history(
                 "opponent_user_id": opponent.user_id if opponent is not None else None,
                 "opponent_username": usernames_by_id.get(opponent.user_id) if opponent is not None else None,
                 "me": participant_result_payload(me),
-                "opponent": participant_result_payload(opponent) if opponent is not None else None,
+                "opponent": (
+                    participant_result_payload(opponent, username=usernames_by_id.get(opponent.user_id))
+                    if opponent is not None else None
+                ),
             }
         )
 
@@ -797,15 +944,36 @@ async def _build_active_state(
     question_index = min(_current_question_order(match), settings.BATTLE_QUESTION_COUNT - 1)
     question = await question_payload_for(db, match, question_index)
     has_answered_current_question = False
+    current_question_results: list[ParticipantQuestionResult] | None = None
+    current_question_correct_answer: str | None = None
     if question is not None:
-        has_answered_current_question = (
+        graded_rows = (
             await db.execute(
-                select(func.count()).select_from(BattleAnswer).where(
-                    BattleAnswer.match_id == match.id, BattleAnswer.user_id == me.user_id,
-                    BattleAnswer.question_id == question["question_id"],
+                select(BattleAnswer).where(
+                    BattleAnswer.match_id == match.id, BattleAnswer.question_id == question["question_id"],
                 )
             )
-        ).scalar() > 0
+        ).scalars().all()
+        has_answered_current_question = any(row.user_id == me.user_id for row in graded_rows)
+        if graded_rows:
+            # A reconnecting client needs to know the current question is
+            # already locked/revealed, not still answerable -- see
+            # BattleMatchStateResponse.current_question_results.
+            current_question_results = [
+                ParticipantQuestionResult(
+                    user_id=row.user_id, answered=bool(row.selected_option), is_correct=row.is_correct,
+                    base_score=row.base_score, speed_bonus=row.speed_bonus, streak_bonus=row.streak_bonus,
+                    total_question_score=row.total_question_score,
+                )
+                for row in graded_rows
+            ]
+            # Safe now -- question_payload_for's `question` dict above
+            # deliberately omits this (spec's "Do Not Send Correct Answers
+            # Early"), but graded_rows being non-empty means this slot is
+            # already locked, so a fresh, separate lookup here is fine.
+            current_question_correct_answer = (
+                await db.execute(select(Question.correct_answer).where(Question.id == question["question_id"]))
+            ).scalar_one_or_none()
 
     my_answers = await _progress_answers(db, match_id=match.id, user_id=me.user_id)
     opponent_answers = (
@@ -819,6 +987,8 @@ async def _build_active_state(
         "time_remaining_seconds": round(_question_time_remaining_seconds(match, question_index), 2),
         "question_index": question_index, "question": question,
         "has_answered_current_question": has_answered_current_question,
+        "current_question_results": current_question_results,
+        "current_question_correct_answer": current_question_correct_answer,
         "my_answers": my_answers, "opponent_answers": opponent_answers,
         "my_progress": {
             "user_id": me.user_id,
@@ -836,16 +1006,22 @@ async def _build_active_state(
 
 
 async def _build_completed_state(
-    match: BattleMatch, *, me: BattleParticipant, opponent: BattleParticipant | None,
+    db: AsyncSession, match: BattleMatch, *, me: BattleParticipant, opponent: BattleParticipant | None,
 ) -> dict:
-    _result_of = participant_result_payload
+    opponent_username = (
+        await db.scalar(select(User.username).where(User.id == opponent.user_id))
+        if opponent is not None else None
+    )
     return {
         "status": "completed", "match_id": match.id, "subject": match.subject, "difficulty": match.difficulty,
         "started_at": match.started_at, "finished_at": match.finished_at,
         "result": {
             "winner_user_id": match.winner_user_id,
-            "me": _result_of(me),
-            "opponent": _result_of(opponent) if opponent is not None else None,
+            "me": participant_result_payload(me),
+            "opponent": (
+                participant_result_payload(opponent, username=opponent_username)
+                if opponent is not None else None
+            ),
         },
     }
 
@@ -870,7 +1046,7 @@ async def get_match_state(
     if match.status == "active":
         return await _build_active_state(db, match=match, me=me, opponent=opponent)
     if match.status == "completed":
-        return await _build_completed_state(match, me=me, opponent=opponent)
+        return await _build_completed_state(db, match, me=me, opponent=opponent)
     if match.status == "cancelled":
         return {"status": "cancelled", "match_id": match.id, "reason": match.cancel_reason}
     # "waiting" -- genuinely expected now (nobody's readied up yet), not a
@@ -950,6 +1126,19 @@ async def submit_battle_answer(
     db: AsyncSession, *, match_id: int, user_id: int, question_id: int, selected_option: str,
     redis: Redis | None = None,
 ) -> dict:
+    """Editable-answer flow: this does NOT grade anything -- it just
+    upserts the player's current pick into Redis (see _set_pending_answer),
+    overwriting any earlier pick for this same question. Players may call
+    this as many times as they like (changing their mind freely) right up
+    until the question locks. Grading/reveal happens once, server-side, at
+    the reveal boundary -- see _grade_and_reveal_question -- using whichever
+    submission was in effect at that instant.
+
+    `redis` is required in practice (both the REST route and the WS route
+    always pass a real client) -- without it, a submission is silently
+    dropped and the question grades as "unanswered" for this player, same
+    as never having called this at all.
+    """
     match = await _get_match_or_404(db, match_id)
     participants = await _get_participants(db, match_id)
     _require_participant(participants, user_id)  # 403 if not a participant
@@ -968,66 +1157,159 @@ async def submit_battle_answer(
     if current_question is None or current_question["question_id"] != question_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This is not the current question.")
 
+    already_graded = (
+        await db.execute(
+            select(func.count()).select_from(BattleAnswer).where(
+                BattleAnswer.match_id == match_id, BattleAnswer.question_id == question_id,
+                BattleAnswer.user_id == user_id,
+            )
+        )
+    ).scalar() > 0
+    if already_graded:
+        # The reveal boundary already fired for this question (see
+        # _grade_and_reveal_question) -- editing is over. Reusing the
+        # BattleAnswer unique constraint as this signal, same as it was
+        # always the anti-replay guard, just repurposed from "already
+        # answered" to "already locked".
+        raise HTTPException(status.HTTP_409_CONFLICT, "Answers are locked for this question.")
+
     now = datetime.now(UTC)
     # Fixed per-question window (lockstep play): response time is measured
     # from when THIS question's window opened, not from the player's own
-    # previous answer.
+    # previous answer -- recomputed fresh on every (re)submission, so
+    # whichever pick is in effect at the lock moment carries its own
+    # correct "time to final answer" for the speed bonus.
     window_start = as_utc(match.started_at) + timedelta(
         seconds=current_order * settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
     )
     response_time_ms = max(0, int((now - window_start).total_seconds() * 1000))
 
-    question = await db.get(Question, question_id)
+    if redis is not None:
+        await _set_pending_answer(
+            redis, match_id=match_id, question_id=question_id, user_id=user_id,
+            selected_option=selected_option, response_time_ms=response_time_ms,
+        )
+
+    return {"question_id": question_id, "selected_option": selected_option}
+
+
+# ── grading + reveal, triggered at the reveal boundary ──────────────────────
+
+async def _grade_one_participant(
+    db: AsyncSession, redis: Redis, *, match_id: int, question: Question, question_id: int,
+    order: int, user_id: int,
+) -> ParticipantQuestionResult:
+    """Grades exactly once per (match, question, user) -- the BattleAnswer
+    unique constraint is the real guard. If this question was already
+    graded (e.g. a second process's progression timer independently reached
+    the same boundary a beat later), read the already-committed row back
+    instead of recomputing -- both processes must reveal the SAME numbers to
+    their own locally-connected sockets.
+    """
+    existing = (
+        await db.execute(
+            select(BattleAnswer).where(
+                BattleAnswer.match_id == match_id, BattleAnswer.question_id == question_id,
+                BattleAnswer.user_id == user_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return ParticipantQuestionResult(
+            user_id=user_id, answered=bool(existing.selected_option),
+            is_correct=existing.is_correct, base_score=existing.base_score,
+            speed_bonus=existing.speed_bonus, streak_bonus=existing.streak_bonus,
+            total_question_score=existing.total_question_score,
+        )
+
+    pending = await _pop_pending_answer(redis, match_id=match_id, question_id=question_id, user_id=user_id)
+    answered = pending is not None
+    selected_option = pending["selected_option"] if pending is not None else ""
+    response_time_ms = (
+        pending["response_time_ms"] if pending is not None
+        # Never answered at all -- score as 0 regardless (is_correct=False
+        # below short-circuits compute_question_score to all-zero), this is
+        # just a well-defined, non-null value for the NOT NULL column.
+        else int((settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS - settings.BATTLE_ANSWER_REVEAL_SECONDS) * 1000)
+    )
     is_correct = bool(
-        question is not None and question.correct_answer is not None
+        answered and question.correct_answer is not None
         and str(question.correct_answer).strip().lower() == str(selected_option).strip().lower()
     )  # exact grading rule mirrored from quiz_service.submit_quiz()
 
     streak_before = await _streak_before(
-        db, match_id=match_id, user_id=user_id, before_question_order=current_order
+        db, match_id=match_id, user_id=user_id, before_question_order=order
     )
     score = compute_question_score(
         is_correct=is_correct, response_time_seconds=response_time_ms / 1000.0,
         streak_after_this_answer=streak_before + 1,
     )
-
-    answer = BattleAnswer(
+    db.add(BattleAnswer(
         match_id=match_id, question_id=question_id, user_id=user_id, selected_option=selected_option,
         is_correct=score.is_correct, response_time_ms=response_time_ms, base_score=score.base_score,
         speed_bonus=score.speed_bonus, streak_bonus=score.streak_bonus, total_question_score=score.total_score,
-    )
-    db.add(answer)
+    ))
     try:
         await db.commit()
     except IntegrityError:
+        # Lost a cross-process grading race -- the winner's row is
+        # authoritative, read it back rather than trusting our own
+        # just-computed (possibly stale-pending-answer) numbers.
         await db.rollback()
-        # Anti-replay -- the DB unique constraint is the real guard here.
-        raise HTTPException(status.HTTP_409_CONFLICT, "You already answered this question.")
-
-    if redis is not None:
-        # Reveals is_correct (but never selected_option) to the opponent so
-        # their progress bar can show this question as correct/incorrect the
-        # instant it's answered -- still upholds "don't leak correct_answer"
-        # since knowing a peer got it right doesn't reveal which option was
-        # right. Delivered to every locally-connected socket for this match,
-        # including the answering user's own -- the client disambiguates
-        # "my own answer" vs "opponent's answer" by comparing user_id, same
-        # pattern as player_ready/opponent_ready collapsing into one wire event.
-        answered_count = await _answered_count(db, match_id=match_id, user_id=user_id)
-        await ws_manager.publish(
-            redis, match_id=match_id,
-            event=OpponentAnsweredEvent(
-                user_id=user_id, answered_count=answered_count,
-                question_order=current_order, is_correct=score.is_correct,
-            ).model_dump(mode="json"),
+        existing = (
+            await db.execute(
+                select(BattleAnswer).where(
+                    BattleAnswer.match_id == match_id, BattleAnswer.question_id == question_id,
+                    BattleAnswer.user_id == user_id,
+                )
+            )
+        ).scalar_one()
+        return ParticipantQuestionResult(
+            user_id=user_id, answered=bool(existing.selected_option),
+            is_correct=existing.is_correct, base_score=existing.base_score,
+            speed_bonus=existing.speed_bonus, streak_bonus=existing.streak_bonus,
+            total_question_score=existing.total_question_score,
         )
 
-    return {
-        "question_id": question_id,
-        "is_correct": score.is_correct, "base_score": score.base_score, "speed_bonus": score.speed_bonus,
-        "streak_bonus": score.streak_bonus, "total_question_score": score.total_score,
-        "response_time_ms": response_time_ms,
-    }
+    return ParticipantQuestionResult(
+        user_id=user_id, answered=answered, is_correct=score.is_correct, base_score=score.base_score,
+        speed_bonus=score.speed_bonus, streak_bonus=score.streak_bonus, total_question_score=score.total_score,
+    )
+
+
+async def _grade_and_reveal_question(
+    db: AsyncSession, redis: Redis, *, match: BattleMatch, order: int,
+) -> QuestionResultEvent | None:
+    """Locks, grades, and builds the reveal payload for BOTH participants of
+    question slot `order` -- called from battle_ws.py's progression timer
+    once that question's remaining time drops to
+    BATTLE_ANSWER_REVEAL_SECONDS. Idempotent/race-safe: calling this more
+    than once for the same (match, order) -- e.g. from two processes each
+    running their own progression timer, or a caller re-observing an
+    already-graded question after reconnecting -- always returns the same
+    result, never double-grades. None only if `order` is somehow out of the
+    frozen question set (shouldn't happen in practice).
+    """
+    row = (
+        await db.execute(
+            select(BattleMatchQuestion.question_id, Question)
+            .join(Question, Question.id == BattleMatchQuestion.question_id)
+            .where(BattleMatchQuestion.match_id == match.id, BattleMatchQuestion.question_order == order)
+        )
+    ).first()
+    if row is None:
+        return None
+    question_id, question = row
+
+    participants = await _get_participants(db, match.id)
+    results = [
+        await _grade_one_participant(
+            db, redis, match_id=match.id, question=question, question_id=question_id,
+            order=order, user_id=p.user_id,
+        )
+        for p in participants
+    ]
+    return QuestionResultEvent(question_order=order, results=results, correct_answer=question.correct_answer)
 
 
 # ── stale-match reaper (Phase 6) ──────────────────────────────────────────
@@ -1053,12 +1335,55 @@ async def submit_battle_answer(
 #
 # Both branches are cancelled with no rating changes (same as a "waiting"
 # match: nothing meaningful to score from an abandoned/never-started game).
+#
+# A third, much shorter-fused case lives here too: a "waiting" match where
+# BOTH players have marked ready (mark_ready) but activation is still
+# withheld because mark_connected never confirmed a live WS for one side
+# within BATTLE_CONNECTION_READY_TIMEOUT_SECONDS (see that setting's own
+# docstring and _try_activate_if_ready_and_connected) -- force-started
+# rather than cancelled, since both players are actively trying to play,
+# not abandoning the match. This is also what makes a REST-only client (one
+# that never opens a socket at all, so mark_connected never fires for it --
+# still a supported mode, see battle_ws.py's module docstring) able to ever
+# reach "countdown": nothing else would ever finalize its activation.
+#
 # run_stale_match_reap_once is a single deterministic pass (directly
 # testable, no sleeps); start_stale_match_reaper_loop is the infinite-loop
 # wrapper only ever started for real at app startup -- mirrors
 # matchmaking_service.start_matchmaking_sweep_loop's exact shape.
 
 _STALE_ACTIVE_STATUSES = ("countdown", "active")
+
+
+async def _force_activate_stalled_ready_matches(db: AsyncSession, redis: Redis, *, skip_ids: set[int]) -> list[int]:
+    waiting_ids = (
+        await db.execute(select(BattleMatch.id).where(BattleMatch.status == "waiting"))
+    ).scalars().all()
+
+    forced_ids: list[int] = []
+    cutoff_seconds = settings.BATTLE_CONNECTION_READY_TIMEOUT_SECONDS
+    for match_id in waiting_ids:
+        if match_id in skip_ids:
+            continue
+        both_ready_at_raw = await redis.get(_both_ready_at_key(match_id))
+        if both_ready_at_raw is None:
+            continue
+        both_ready_at = datetime.fromisoformat(both_ready_at_raw)
+        if (datetime.now(UTC) - as_utc(both_ready_at)).total_seconds() < cutoff_seconds:
+            continue
+
+        match = await get_match_row(db, match_id)
+        if match is None or match.status != "waiting":
+            continue  # already handled (activated/cancelled) by another process/tick
+        await _finalize_activation(db, redis, match=match)
+        forced_ids.append(match_id)
+
+    if forced_ids:
+        logger.warning(
+            "Battle match(es) %s force-activated -- both players ready but a WS "
+            "connection never confirmed within %.1fs.", forced_ids, cutoff_seconds,
+        )
+    return forced_ids
 
 
 async def run_stale_match_reap_once(db: AsyncSession, redis: Redis) -> int:
@@ -1079,30 +1404,29 @@ async def run_stale_match_reap_once(db: AsyncSession, redis: Redis) -> int:
     ).scalars().all()
 
     stale_ids = [*waiting_ids, *active_ids]
-    if not stale_ids:
-        return 0
+    if stale_ids:
+        if waiting_ids:
+            await db.execute(
+                update(BattleMatch)
+                .where(BattleMatch.id.in_(waiting_ids))
+                .values(status="cancelled", cancel_reason="Orphaned before matchmaking finalized.")
+            )
+        if active_ids:
+            await db.execute(
+                update(BattleMatch)
+                .where(BattleMatch.id.in_(active_ids))
+                .values(status="cancelled", cancel_reason="Abandoned -- no activity from either player.")
+            )
+        await db.commit()
 
-    if waiting_ids:
-        await db.execute(
-            update(BattleMatch)
-            .where(BattleMatch.id.in_(waiting_ids))
-            .values(status="cancelled", cancel_reason="Orphaned before matchmaking finalized.")
-        )
-    if active_ids:
-        await db.execute(
-            update(BattleMatch)
-            .where(BattleMatch.id.in_(active_ids))
-            .values(status="cancelled", cancel_reason="Abandoned -- no activity from either player.")
-        )
-    await db.commit()
+        for match_id in stale_ids:
+            participants = await _get_participants(db, match_id)
+            for p in participants:
+                await release_match_state(redis, user_id=p.user_id)
+            logger.warning("Battle match %d reaped -- stale and abandoned, no rating changes applied.", match_id)
 
-    for match_id in stale_ids:
-        participants = await _get_participants(db, match_id)
-        for p in participants:
-            await release_match_state(redis, user_id=p.user_id)
-        logger.warning("Battle match %d reaped -- stale and abandoned, no rating changes applied.", match_id)
-
-    return len(stale_ids)
+    forced_ids = await _force_activate_stalled_ready_matches(db, redis, skip_ids=set(waiting_ids))
+    return len(stale_ids) + len(forced_ids)
 
 
 async def start_stale_match_reaper_loop() -> None:

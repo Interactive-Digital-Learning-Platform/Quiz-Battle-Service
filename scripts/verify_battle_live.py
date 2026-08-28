@@ -288,6 +288,14 @@ async def run_full_flow(client: httpx.AsyncClient) -> None:
         question_id = (question_started_a or {}).get("question", {}).get("question_id")
         check("question_id extracted", question_id is not None)
 
+        # Grading/reveal is deferred to the reveal boundary (last
+        # BATTLE_ANSWER_REVEAL_SECONDS of the question's window, see
+        # battle_gameplay_service._grade_and_reveal_question) -- submitting
+        # (over REST or WS) is just an ack now, never correctness, and
+        # there's no more immediate opponent_answered push. Waiting out a
+        # real ~25s to observe question_result isn't done here (this script
+        # forfeits shortly after instead, see below); that flow is covered
+        # by tests/test_battle_ws_routes.py's editable-answer tests instead.
         r = await client.post(
             f"{BASE_URL}/api/v1/battle/match/{match_id}/answer",
             json={"question_id": question_id, "selected_option": "A"},
@@ -295,9 +303,6 @@ async def run_full_flow(client: httpx.AsyncClient) -> None:
         )
         check("A answers question 0 over REST (200)", r.status_code == 200)
         check("REST answer response never includes correct_answer", "correct_answer" not in r.text)
-
-        opponent_answered_b = await _drain_until(ws_b, "opponent_answered", timeout=5)
-        check("B is notified over WS of A's REST-submitted answer", opponent_answered_b is not None)
 
         await ws_b.send(json.dumps({"type": "answer", "question_id": question_id, "selected_option": "A"}))
         ack_b = await _drain_until(ws_b, "answer_acknowledged", timeout=5)

@@ -54,6 +54,7 @@ from app.schemas.battle_ws import (
     MatchStartedEvent,
     PlayerDisconnectedEvent,
     PlayerReconnectedEvent,
+    QuestionResultEvent,
     QuestionStartedEvent,
     StateSyncEvent,
     WSAnswerMessage,
@@ -73,9 +74,12 @@ router = APIRouter(prefix="/battle", tags=["Battle Realtime"])
 _TERMINAL_STATUSES = ("completed", "cancelled")
 
 # (match_id, disconnected_user_id) -> the task counting down their grace
-# period. Keyed so a second `player_disconnected` delivery for the same
-# still-disconnected user (e.g. re-delivered via a duplicate subscriber
-# wakeup) doesn't spawn a redundant countdown.
+# period. A later `player_disconnected` for the same user (a genuine new
+# drop, or a same-deadline redelivery) always cancels-and-replaces whatever
+# is here rather than being dropped -- see _make_on_event below for why a
+# plain "already pending, ignore" dedup let a disconnect -> reconnect ->
+# disconnect flap forfeit a player who was safely inside their NEW grace
+# window.
 _pending_grace_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
@@ -124,6 +128,24 @@ async def _resolve_authorized_user(
         return user.id
 
 
+async def _mark_connected_safely(*, match_id: int, user_id: int, redis: Redis) -> None:
+    # Fire-and-forget wrapper around mark_connected -- see its call site in
+    # battle_match_ws for why this runs detached rather than awaited inline.
+    # Best-effort, same rationale as bump_connection_generation/
+    # clear_disconnect_marker in the connect handler: never fail an
+    # already-accepted socket over this. Worst case, activation for a match
+    # still "waiting" on both ready+connected is delayed until the
+    # stale-match reaper's BATTLE_CONNECTION_READY_TIMEOUT_SECONDS fallback
+    # forces it.
+    try:
+        async with AsyncSessionLocal() as db:
+            await battle_gameplay_service.mark_connected(db, redis, match_id=match_id, user_id=user_id)
+    except Exception:
+        logger.exception(
+            "Failed to mark WS connection ready for activation — match_id=%d, user_id=%d", match_id, user_id
+        )
+
+
 async def _grace_check_task(*, match_id: int, user_id: int, deadline: datetime, redis: Redis) -> None:
     try:
         delay = max(0.0, (deadline - datetime.now(UTC)).total_seconds())
@@ -144,7 +166,14 @@ async def _grace_check_task(*, match_id: int, user_id: int, deadline: datetime, 
     except asyncio.CancelledError:
         raise
     finally:
-        _pending_grace_tasks.pop((match_id, user_id), None)
+        # Only remove this task's OWN entry -- if a later disconnect already
+        # cancelled-and-replaced it (see _make_on_event), the dict now holds
+        # that newer task under the same key, and a blind pop-by-key here
+        # (racing this cancelled task's teardown against that replacement)
+        # would delete the newer task's tracking entry instead, even though
+        # the newer task itself keeps running unaffected.
+        if _pending_grace_tasks.get((match_id, user_id)) is asyncio.current_task():
+            _pending_grace_tasks.pop((match_id, user_id), None)
 
 
 def _make_on_event(*, match_id: int, redis: Redis):
@@ -158,12 +187,22 @@ def _make_on_event(*, match_id: int, redis: Redis):
             return
         disconnected_user_id = event.get("user_id")
         key = (match_id, disconnected_user_id)
-        if key in _pending_grace_tasks:
-            return
         try:
             deadline = datetime.fromisoformat(event["deadline"])
         except (KeyError, ValueError):
             return
+        # Cancel any task already tracking an earlier deadline for this user
+        # instead of ignoring this event -- a disconnect -> reconnect ->
+        # disconnect flap rewrites the Redis deadline marker to this new,
+        # later value (mark_disconnected), but is_still_disconnected only
+        # checks whether the marker exists, not which deadline it encodes.
+        # Leaving the ORIGINAL task running meant it woke at the FIRST
+        # (stale) deadline, found the marker still there (now the SECOND
+        # disconnect's), and forfeited a player who was still safely inside
+        # their new grace window.
+        existing = _pending_grace_tasks.get(key)
+        if existing is not None:
+            existing.cancel()
         _pending_grace_tasks[key] = asyncio.create_task(
             _grace_check_task(match_id=match_id, user_id=disconnected_user_id, deadline=deadline, redis=redis)
         )
@@ -241,91 +280,124 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
     """
     previous_status: str | None = None
     previous_question_index: int | None = None
-    try:
-        while True:
-            async with AsyncSessionLocal() as db:
-                match = await battle_gameplay_service.get_match_row(db, match_id)
-                if match is None:
-                    return
-                match = await battle_gameplay_service._ensure_match_progressed(db, match, redis)
-                current_status = match.status
+    # Tracks which question slot's reveal boundary this loop has already
+    # graded -- distinct from previous_question_index (a NEW question
+    # starting) because these are two independent boundaries within the
+    # SAME question's window: question_started fires at the window's open,
+    # this fires BATTLE_ANSWER_REVEAL_SECONDS before it closes. Grading
+    # itself (_grade_and_reveal_question) is idempotent/race-safe, so this
+    # tracker is purely to avoid redundant DB round-trips every tick once a
+    # question is already locked, not a correctness requirement.
+    graded_question_index: int | None = None
+    # No top-level try/except here anymore -- an unhandled exception now
+    # propagates straight out of this coroutine on purpose, so
+    # battle_connection_manager.py's supervisor (which wraps every call to
+    # this function) can detect it and restart the loop. Swallowing it here
+    # used to mean one transient DB/Redis error silently ended this task for
+    # good, freezing that match's question progression forever for anyone
+    # routed to this process, since it's only ever started once (on the
+    # first local connection).
+    while True:
+        async with AsyncSessionLocal() as db:
+            match = await battle_gameplay_service.get_match_row(db, match_id)
+            if match is None:
+                return
+            match = await battle_gameplay_service._ensure_match_progressed(db, match, redis)
+            current_status = match.status
 
-                if current_status == "completed":
-                    # previous_status is only ever None on this task's very
-                    # first tick -- reaching "completed" without having first
-                    # observed the match non-terminal means it was ALREADY
-                    # over before this task (hence this connection) even
-                    # started, e.g. a client reconnecting to a long-finished
-                    # match. StateSyncEvent (sent separately, right after
-                    # connect) already tells this new connection the outcome
-                    # -- re-pushing match_finished here too would make the
-                    # client replay its "just now completed" side effects
-                    # (the forfeit/win toast, the navigate-to-results effect)
-                    # for a result it's only just learning about, not one
-                    # that just happened.
-                    if previous_status is not None:
-                        event = await battle_ws_events.match_finished_event(db, match)
-                        await ws_manager.push_local(match_id, event)
-                    return
+            if current_status == "completed":
+                # previous_status is only ever None on this task's very
+                # first tick -- reaching "completed" without having first
+                # observed the match non-terminal means it was ALREADY
+                # over before this task (hence this connection) even
+                # started, e.g. a client reconnecting to a long-finished
+                # match. StateSyncEvent (sent separately, right after
+                # connect) already tells this new connection the outcome
+                # -- re-pushing match_finished here too would make the
+                # client replay its "just now completed" side effects
+                # (the forfeit/win toast, the navigate-to-results effect)
+                # for a result it's only just learning about, not one
+                # that just happened.
+                if previous_status is not None:
+                    event = await battle_ws_events.match_finished_event(db, match)
+                    await ws_manager.push_local(match_id, event)
+                return
 
-                if current_status == "cancelled":
-                    if previous_status is not None:
-                        await ws_manager.push_local(match_id, battle_ws_events.match_cancelled_event(match))
-                    return
+            if current_status == "cancelled":
+                if previous_status is not None:
+                    await ws_manager.push_local(match_id, battle_ws_events.match_cancelled_event(match))
+                return
 
-                if stop_event.is_set():
-                    # Still active/countdown/waiting even after the check
-                    # above -- a genuine early exit (last connection closed
-                    # mid-match), not a missed finalize. Safe to stop.
-                    return
+            if stop_event.is_set():
+                # Still active/countdown/waiting even after the check
+                # above -- a genuine early exit (last connection closed
+                # mid-match), not a missed finalize. Safe to stop.
+                return
 
-                if current_status == "active":
-                    if previous_status != "active":
+            if current_status == "active":
+                if previous_status != "active":
+                    await ws_manager.push_local(
+                        match_id,
+                        MatchStartedEvent(
+                            started_at=match.started_at,
+                            subject=match.subject,
+                            difficulty=match.difficulty,
+                            question_count=settings.BATTLE_QUESTION_COUNT,
+                        ).model_dump(mode="json"),
+                    )
+
+                current_index = min(
+                    battle_gameplay_service._current_question_order(match),
+                    settings.BATTLE_QUESTION_COUNT - 1,
+                )
+                if current_index != previous_question_index:
+                    question = await battle_gameplay_service.question_payload_for(db, match, current_index)
+                    if question is not None:
                         await ws_manager.push_local(
                             match_id,
-                            MatchStartedEvent(started_at=match.started_at).model_dump(mode="json"),
+                            QuestionStartedEvent(
+                                question_index=current_index, question=question,
+                                time_remaining_seconds=battle_gameplay_service._question_time_remaining_seconds(
+                                    match, current_index
+                                ),
+                            ).model_dump(mode="json"),
                         )
+                    previous_question_index = current_index
 
-                    current_index = min(
-                        battle_gameplay_service._current_question_order(match),
-                        settings.BATTLE_QUESTION_COUNT - 1,
+                remaining = battle_gameplay_service._question_time_remaining_seconds(match, current_index)
+                if (
+                    remaining <= settings.BATTLE_ANSWER_REVEAL_SECONDS
+                    and graded_question_index != current_index
+                ):
+                    result_event = await battle_gameplay_service._grade_and_reveal_question(
+                        db, redis, match=match, order=current_index,
                     )
-                    if current_index != previous_question_index:
-                        question = await battle_gameplay_service.question_payload_for(db, match, current_index)
-                        if question is not None:
-                            await ws_manager.push_local(
-                                match_id,
-                                QuestionStartedEvent(
-                                    question_index=current_index, question=question,
-                                    time_remaining_seconds=battle_gameplay_service._question_time_remaining_seconds(
-                                        match, current_index
-                                    ),
-                                ).model_dump(mode="json"),
-                            )
-                        previous_question_index = current_index
+                    if result_event is not None:
+                        await ws_manager.push_local(match_id, result_event.model_dump(mode="json"))
+                    graded_question_index = current_index
 
-                    sleep_seconds = max(
-                        0.05,
-                        battle_gameplay_service._question_time_remaining_seconds(match, current_index),
-                    )
-                elif current_status == "countdown":
-                    remaining = max(
-                        0.0,
-                        (battle_gameplay_service.as_utc(match.started_at) - datetime.now(UTC)).total_seconds(),
-                    )
-                    sleep_seconds = min(remaining, settings.BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS) or 0.05
-                else:  # "waiting"
-                    sleep_seconds = settings.BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS
+                if graded_question_index == current_index:
+                    # Already locked -- nothing more to do until the
+                    # next question's window opens.
+                    sleep_seconds = max(0.05, remaining)
+                else:
+                    sleep_seconds = max(0.05, remaining - settings.BATTLE_ANSWER_REVEAL_SECONDS)
+            elif current_status == "countdown":
+                remaining = max(
+                    0.0,
+                    (battle_gameplay_service.as_utc(match.started_at) - datetime.now(UTC)).total_seconds(),
+                )
+                sleep_seconds = min(remaining, settings.BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS) or 0.05
+            else:  # "waiting"
+                sleep_seconds = settings.BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS
 
-                previous_status = current_status
+            previous_status = current_status
 
-            if await _sleep_or_stop(stop_event, sleep_seconds):
-                # Stop requested mid-sleep -- loop back for exactly one more
-                # _ensure_match_progressed pass (see docstring) before the
-                # `stop_event.is_set()` check above actually honors it.
-                continue
-    except Exception:
-        logger.exception("Battle match %d: progression timer failed.", match_id)
+        if await _sleep_or_stop(stop_event, sleep_seconds):
+            # Stop requested mid-sleep -- loop back for exactly one more
+            # _ensure_match_progressed pass (see docstring) before the
+            # `stop_event.is_set()` check above actually honors it.
+            continue
 
 
 @router.websocket("/match/{match_id}/ws")
@@ -396,6 +468,21 @@ async def battle_match_ws(
         await websocket.send_json(
             StateSyncEvent(state=BattleMatchStateResponse(**state)).model_dump(mode="json")
         )
+
+        # Detached, not awaited -- this connection's own state_sync above
+        # doesn't depend on mark_connected's result. Deliberately placed
+        # AFTER state_sync is sent (not right after ConnectedEvent, before
+        # get_match_state): spawning it earlier -- even as a detached task,
+        # even sharing get_match_state's own session so no extra DB
+        # round-trip was added -- reproducibly wedged fakeredis's pub/sub
+        # `listen()` loop against this same Redis instance in a two-socket
+        # disconnect test (the message was published and even handed to
+        # send_json successfully server-side, yet the other socket's
+        # receive_json() never woke for it). Isolated directly to the mere
+        # act of a `redis.hset` running concurrently with get_match_state's
+        # own in-flight Redis/DB work during this window; moving it past
+        # that window removed the interleaving entirely.
+        asyncio.create_task(_mark_connected_safely(match_id=match_id, user_id=user_id, redis=redis))
 
         while True:
             raw_text = await websocket.receive_text()

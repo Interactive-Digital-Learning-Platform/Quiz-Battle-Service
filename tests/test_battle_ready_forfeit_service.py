@@ -92,6 +92,8 @@ async def test_both_sided_ready_triggers_exactly_one_countdown_transition(db_ses
     db_session.add_all(questions)
     await db_session.flush()
 
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
     await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
 
     select_mock = AsyncMock(return_value=questions)
@@ -128,6 +130,8 @@ async def test_ai_failure_during_ready_triggered_selection_cancels_cleanly(db_se
     await fake_redis.hset(matchmaking_service._user_state_key(user_a.id), "state", "in_match")
     await fake_redis.hset(matchmaking_service._user_state_key(user_b.id), "state", "in_match")
 
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
     await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
     with patch(
         "app.services.battle_gameplay_service.select_battle_questions",
@@ -159,6 +163,8 @@ async def test_countdown_to_active_lazy_transition_via_backdated_started_at(db_s
     db_session.add_all(questions)
     await db_session.flush()
 
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
     await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
     with patch(
         "app.services.battle_gameplay_service.select_battle_questions",
@@ -181,6 +187,103 @@ async def test_countdown_to_active_lazy_transition_via_backdated_started_at(db_s
     assert active_state["status"] == "active"
     assert active_state["question_index"] == 0
     assert active_state["question"] is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mark_connected -- activation gate (see _try_activate_if_ready_and_connected)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def test_both_ready_but_only_one_connected_stays_waiting(db_session, fake_redis):
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(db_session, user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000)
+
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    with patch(
+        "app.services.battle_gameplay_service.select_battle_questions",
+        new=AsyncMock(side_effect=AssertionError("should not select questions -- user_b never connected")),
+    ):
+        match = await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
+
+    assert match.status == "waiting"
+
+
+async def test_connect_after_both_ready_is_what_triggers_activation(db_session, fake_redis):
+    # The mirror image of the ready-then-connect ordering already covered
+    # above -- whichever of the two signals (ready, connected) completes the
+    # pair LAST is what fires activation. Here both ready up first (with
+    # neither connected yet), then connecting finishes the job.
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(db_session, user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000)
+    questions = _fixed_questions()
+    db_session.add_all(questions)
+    await db_session.flush()
+
+    await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
+
+    match = await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    assert match.status == "waiting"  # only one of two connected so far
+
+    with patch(
+        "app.services.battle_gameplay_service.select_battle_questions",
+        new=AsyncMock(return_value=questions),
+    ):
+        match = await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
+
+    assert match.status == "countdown"
+    assert match.started_at is not None
+
+
+async def test_mark_connected_is_a_noop_once_past_waiting(db_session, fake_redis):
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(db_session, user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000)
+    await db_session.execute(
+        update(BattleMatch).where(BattleMatch.id == match.id).values(status="active", started_at=datetime.now(UTC))
+    )
+    await db_session.commit()
+
+    result = await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    assert result is None  # no-op -- this gate is only about pre-activation "waiting"
+
+
+async def test_reaper_force_activates_when_both_ready_but_never_connected(db_session, fake_redis, monkeypatch):
+    # Covers a REST-only client (mark_connected never fires for one that
+    # never opens a socket at all) and the rare real case where a WS
+    # connection is delayed past BATTLE_CONNECTION_READY_TIMEOUT_SECONDS --
+    # both players are still actively trying to play, so this force-starts
+    # the match rather than reaping it as abandoned (contrast with
+    # test_forfeit_from_waiting_cancels_match_with_no_scoring above, which is
+    # a genuine early exit).
+    from app.core.config import settings as app_settings
+    monkeypatch.setattr(app_settings, "BATTLE_CONNECTION_READY_TIMEOUT_SECONDS", 0.0)
+
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(db_session, user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000)
+    questions = _fixed_questions()
+    db_session.add_all(questions)
+    await db_session.flush()
+
+    await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
+
+    match = await battle_gameplay_service.get_match_row(db_session, match.id)
+    assert match.status == "waiting"  # neither ever connected
+
+    with patch(
+        "app.services.battle_gameplay_service.select_battle_questions",
+        new=AsyncMock(return_value=questions),
+    ):
+        forced = await battle_gameplay_service.run_stale_match_reap_once(db_session, fake_redis)
+
+    assert forced == 1
+    match = await battle_gameplay_service.get_match_row(db_session, match.id)
+    assert match.status == "countdown"
+    assert match.started_at is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

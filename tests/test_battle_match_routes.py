@@ -111,6 +111,12 @@ async def test_ready_from_both_participants_starts_countdown_then_active(client,
     db_session.add_all(questions)
     await db_session.commit()
 
+    # Activation requires ready AND WS-connected (see mark_connected) --
+    # connect both upfront so this test exercises the ready-flow itself,
+    # not the connection gate (that's covered separately).
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=me.id)
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=other.id)
+
     # Only one side ready so far -- must stay "waiting".
     ready_resp = await client.post(f"/api/v1/battle/match/{match.id}/ready")
     assert ready_resp.status_code == 200
@@ -150,6 +156,8 @@ async def test_answer_endpoint_never_leaks_correct_answer(client, db_session, fa
     db_session.add_all(questions)
     await db_session.commit()
 
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=me.id)
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match.id, user_id=other.id)
     await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=other.id)
     with patch(
         "app.services.battle_gameplay_service.select_battle_questions",
@@ -159,7 +167,13 @@ async def test_answer_endpoint_never_leaks_correct_answer(client, db_session, fa
 
     await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=1))
     state_resp = await client.get(f"/api/v1/battle/match/{match.id}/state")
-    assert "correct_answer" not in json.dumps(state_resp.json())
+    # Only 1s into a still-answerable question -- current_question_correct_
+    # answer must be null (not yet safe to reveal). Checking the substring
+    # "correct_answer" against the whole serialized body would false-positive
+    # on this field's own KEY name once it's legitimately present (see
+    # BattleMatchStateResponse.current_question_correct_answer) -- assert its
+    # value instead.
+    assert state_resp.json().get("current_question_correct_answer") is None
 
     answer_resp = await client.post(
         f"/api/v1/battle/match/{match.id}/answer",
@@ -192,6 +206,8 @@ async def test_full_end_to_end_battle_flow(client, db_session, fake_redis):
     db_session.add_all(questions)
     await db_session.commit()
 
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match_id, user_id=me.id)
+    await battle_gameplay_service.mark_connected(db_session, fake_redis, match_id=match_id, user_id=other.id)
     await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match_id, user_id=other.id)
     with patch(
         "app.services.battle_gameplay_service.select_battle_questions",
@@ -205,7 +221,11 @@ async def test_full_end_to_end_battle_flow(client, db_session, fake_redis):
     assert state_resp.json()["status"] == "active"
 
     # "me" answers every question correctly, advancing through each
-    # question's window in turn; the opponent never answers.
+    # question's window in turn; the opponent never answers. Grading is
+    # deferred to the reveal boundary (normally driven by the WS
+    # progression timer, see battle_ws.py's _progression_timer) -- this
+    # REST-only flow forces that boundary explicitly after each submission
+    # so match completion/scoring still gets exercised end-to-end.
     for i in range(N):
         await _set_started_at(db_session, match_id, datetime.now(UTC) - timedelta(seconds=i * Q + 1))
         answer_resp = await client.post(
@@ -213,7 +233,9 @@ async def test_full_end_to_end_battle_flow(client, db_session, fake_redis):
             json={"question_id": questions[i].id, "selected_option": "A"},
         )
         assert answer_resp.status_code == 200
-        assert answer_resp.json()["is_correct"] is True
+        assert answer_resp.json()["selected_option"] == "A"
+        match = await battle_gameplay_service.get_match_row(db_session, match_id)
+        await battle_gameplay_service._grade_and_reveal_question(db_session, fake_redis, match=match, order=i)
 
     await _set_started_at(db_session, match_id, datetime.now(UTC) - timedelta(seconds=N * Q + 1))
     final_state_resp = await client.get(f"/api/v1/battle/match/{match_id}/state")

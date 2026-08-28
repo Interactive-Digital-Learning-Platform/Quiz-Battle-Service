@@ -346,10 +346,10 @@ def test_closing_one_socket_notifies_the_other(ws_env):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Answer submission over WS -- acknowledgement + opponent privacy
+# Answer submission over WS -- editable answers, deferred grading/reveal
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_ws_answer_acknowledged_and_opponent_notified_without_leaking_selection(ws_env):
+def test_ws_answer_acknowledged_without_revealing_correctness(ws_env):
     questions = _fixed_questions()
     ws_env.seed_questions(questions)
 
@@ -374,37 +374,155 @@ def test_ws_answer_acknowledged_and_opponent_notified_without_leaking_selection(
             question_id = questions[0].id
             assert question_started_a["question"]["question_id"] == question_id
 
+            # Grading is deferred to the reveal boundary now -- submitting
+            # (well before it, question 0's window is Q seconds long) just
+            # gets a lightweight ack, never correctness, and the opponent
+            # gets nothing at all yet (no more instant opponent_answered).
             ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "A"})
-            # A gets BOTH a direct answer_acknowledged AND its own action's
-            # opponent_answered broadcast (every publish reaches every
-            # locally-connected socket, including the publisher's own).
-            ack_events_a = _events_by_type(ws_a, 2)
-            opponent_event = ws_b.receive_json()
+            ack = ws_a.receive_json()
 
-    ack = ack_events_a["answer_acknowledged"]
+    assert ack["type"] == "answer_acknowledged"
     assert ack["question_id"] == question_id
-    assert ack["is_correct"] is True
-    assert ack["base_score"] == settings.BATTLE_SCORE_BASE_CORRECT
+    assert ack["selected_option"] == "A"
+    assert "is_correct" not in ack
     assert "correct_answer" not in ack
-    assert "selected_option" not in ack
 
-    self_broadcast = ack_events_a["opponent_answered"]
-    for event in (self_broadcast, opponent_event):
-        assert event["type"] == "opponent_answered"
-        assert event["user_id"] == ws_env.user_a_id
-        assert event["answered_count"] == 1
-        # Reveals is_correct/question_order (drives the opponent's live
-        # progress-bar segment) but never the selected option itself.
+
+def test_ws_editable_answer_locks_and_reveals_both_players_at_boundary(ws_env, monkeypatch):
+    # Small, test-local timings so crossing the reveal boundary doesn't
+    # require a real ~25s wait -- monkeypatch reverts automatically, and
+    # battle_gameplay_service/battle_ws read these settings live (not cached
+    # at import time), so this affects the real progression timer running
+    # in the background for this test's connections. Deliberately only ONE
+    # backdate call: a second one racing against the progression timer's
+    # ALREADY-scheduled sleep (computed from the first tick's stale
+    # "remaining") can't wake it early, so real wall-clock time can blow
+    # past the intended target before the timer ever re-reads the DB.
+    # Instead, size the answerable window (question_seconds - reveal_seconds)
+    # generously above the two answer round-trips below, and let the timer's
+    # own natural sleep carry it into the reveal boundary.
+    question_seconds = 5.0
+    reveal_seconds = 4.5
+    monkeypatch.setattr(settings, "BATTLE_QUESTION_TIME_LIMIT_SECONDS", question_seconds)
+    monkeypatch.setattr(settings, "BATTLE_ANSWER_REVEAL_SECONDS", reveal_seconds)
+    # The "countdown" phase only polls every BATTLE_WS_WAITING_POLL_INTERVAL_
+    # SECONDS (1.0s default) -- without shrinking it, up to a full extra
+    # real second can elapse between backdating started_at into the past and
+    # the timer actually noticing the countdown->active transition, eating
+    # into the (question_seconds - reveal_seconds) answerable window before
+    # the test ever gets a chance to submit anything.
+    monkeypatch.setattr(settings, "BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS", 0.02)
+
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
+        ws_a.receive_json()
+        ws_a.receive_json()
+        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+            ws_b.receive_json()
+            ws_b.receive_json()
+
+            _ready_up_to_active(ws_a, ws_b, questions)
+            ws_env.backdate_started_at(seconds_ago=0.05)
+
+            ws_a.receive_json()  # match_started
+            question_started_a = ws_a.receive_json()
+            ws_b.receive_json()
+            ws_b.receive_json()
+            question_id = questions[0].id
+            assert question_started_a["question"]["question_id"] == question_id
+
+            ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "B"})
+            ack1 = ws_a.receive_json()
+            assert ack1["selected_option"] == "B"
+
+            # Changed their mind before the reveal boundary -- editable
+            # answers: this must succeed (overwrite), not 409.
+            ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "A"})
+            ack2 = ws_a.receive_json()
+            assert ack2["selected_option"] == "A"
+
+            # No further action needed -- the progression timer's own sleep
+            # (~ (question_seconds - 0.05) - reveal_seconds ≈ 0.45s) carries
+            # it into the reveal boundary on its own; both players' answers
+            # lock and get graded/revealed together, simultaneously.
+            result_a = ws_a.receive_json()
+            result_b = ws_b.receive_json()
+
+    for event in (result_a, result_b):
+        assert event["type"] == "question_result"
         assert event["question_order"] == 0
-        assert event["is_correct"] is True
-        assert "selected_option" not in event
+        by_user = {r["user_id"]: r for r in event["results"]}
+        # Graded on the LAST submission ("A", the correct one), not the
+        # first ("B") -- and never leaks selected_option to either side.
+        assert by_user[ws_env.user_a_id]["answered"] is True
+        assert by_user[ws_env.user_a_id]["is_correct"] is True
+        assert by_user[ws_env.user_a_id]["base_score"] == settings.BATTLE_SCORE_BASE_CORRECT
+        assert "selected_option" not in by_user[ws_env.user_a_id]
+        # user_b never submitted anything -- graded as unanswered/incorrect,
+        # locked in at the same instant as user_a's.
+        assert by_user[ws_env.user_b_id]["answered"] is False
+        assert by_user[ws_env.user_b_id]["is_correct"] is False
+
+
+def test_ws_resubmitting_after_lock_is_rejected(ws_env, monkeypatch):
+    question_seconds = 5.0
+    reveal_seconds = 4.5
+    monkeypatch.setattr(settings, "BATTLE_QUESTION_TIME_LIMIT_SECONDS", question_seconds)
+    monkeypatch.setattr(settings, "BATTLE_ANSWER_REVEAL_SECONDS", reveal_seconds)
+
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
+        ws_a.receive_json()
+        ws_a.receive_json()
+        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+            ws_b.receive_json()
+            ws_b.receive_json()
+
+            _ready_up_to_active(ws_a, ws_b, questions)
+            # Backdate straight into the reveal window -- already locked
+            # (remaining well below reveal_seconds) from the very first
+            # "active" tick, with plenty of real wall-clock time left (4s)
+            # before the next question begins, however long the
+            # resubmission attempt below takes.
+            ws_env.backdate_started_at(seconds_ago=1.0)
+
+            ws_a.receive_json()  # match_started
+            question_started_a = ws_a.receive_json()
+            ws_b.receive_json()
+            ws_b.receive_json()
+            question_id = questions[0].id
+
+            # Already past the reveal boundary (remaining=4.0 < reveal=4.5)
+            # -- the very first "active" tick grades and reveals immediately.
+            ws_a.receive_json()  # question_result
+            ws_b.receive_json()  # question_result
+
+            ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "A"})
+            error = ws_a.receive_json()
+
+    assert error["type"] == "error"
+    assert "locked" in error["detail"].lower()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reconnect within the grace period -- state restoration
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_reconnect_within_grace_period_restores_state_and_notifies_opponent(ws_env):
+def test_reconnect_within_grace_period_restores_state_and_notifies_opponent(ws_env, monkeypatch):
+    # Widened well past this test's real wall-clock runtime -- the
+    # grading/reveal boundary fires once real elapsed time since (backdated)
+    # started_at crosses BATTLE_QUESTION_TIME_LIMIT_SECONDS -
+    # BATTLE_ANSWER_REVEAL_SECONDS (25s at the real defaults), which this
+    # test's own socket-handshake overhead can approach or exceed on a
+    # loaded machine, non-deterministically flipping the final event from
+    # state_sync to question_result. This test only cares about reconnect/
+    # state-restoration behavior, not question timing, so removing that race
+    # entirely is correct rather than just padding the margin.
+    monkeypatch.setattr(settings, "BATTLE_QUESTION_TIME_LIMIT_SECONDS", 300.0)
     questions = _fixed_questions()
     ws_env.seed_questions(questions)
 
@@ -426,7 +544,7 @@ def test_reconnect_within_grace_period_restores_state_and_notifies_opponent(ws_e
             disconnected_event = ws_b.receive_json()
             assert disconnected_event["type"] == "player_disconnected"
 
-            # A reconnects well within the (now 15s-default) grace period.
+            # A reconnects well within the grace period.
             with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a2:
                 reconnected_event = ws_b.receive_json()
                 assert reconnected_event["type"] == "player_reconnected"

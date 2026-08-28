@@ -101,10 +101,29 @@ class Settings(BaseSettings):
     # as unanswered -- see _ensure_match_progressed).
     BATTLE_QUESTION_COUNT: int = 10
     BATTLE_QUESTION_TIME_LIMIT_SECONDS: float = 30.0
+    # Both players' answers lock, get graded, and are revealed together
+    # during the last N seconds of each question's window -- the answerable
+    # window is BATTLE_QUESTION_TIME_LIMIT_SECONDS - BATTLE_ANSWER_REVEAL_
+    # SECONDS (25s by default), computed inline wherever needed rather than
+    # stored as its own setting so the two can't drift out of sync. See
+    # battle_gameplay_service._grade_and_reveal_question and battle_ws.py's
+    # _progression_timer.
+    BATTLE_ANSWER_REVEAL_SECONDS: float = 5.0
     # grade has no persistence anywhere (not a Question column, prompt-text-
     # only for Groq).
     BATTLE_QUESTION_GRADE_DEFAULT: int = 10
-    BATTLE_QUESTION_GROQ_MAX_CALLS: int = 3
+    # Match activation (battle_question_service.py) never calls Groq live --
+    # it only ever reads the DB pool, per (subject, difficulty) bucket, so a
+    # slow/rate-limited/down Groq can no longer stall or fail match start.
+    # A bucket read below BATTLE_POOL_MIN_SIZE kicks off a debounced,
+    # fire-and-forget background top-up back up to BATTLE_POOL_TARGET_SIZE
+    # (capped at BATTLE_POOL_TOPUP_MAX_BATCH questions per Groq call) --
+    # mirrors Personalized-Quiz-Service's own POOL_MIN_SIZE/POOL_TARGET_SIZE/
+    # POOL_TOPUP_MAX_BATCH (separate settings here since this is a different
+    # service/process/config file, not a shared value).
+    BATTLE_POOL_MIN_SIZE: int = 20
+    BATTLE_POOL_TARGET_SIZE: int = 60
+    BATTLE_POOL_TOPUP_MAX_BATCH: int = 20
 
     # Base correct score -- wrong answer is always 0, never negative.
     BATTLE_SCORE_BASE_CORRECT: int = 100
@@ -137,11 +156,32 @@ class Settings(BaseSettings):
     # auto-activate-on-poll trigger). See app/api/routes/battle_ws.py and
     # app/services/battle_connection_manager.py.
     BATTLE_COUNTDOWN_DURATION_SECONDS: float = 5.0
+    # Activation (mark_ready -> _activate_countdown) waits for a participant
+    # to be BOTH ready AND have a live WS connection confirmed (see
+    # mark_connected) before starting that match's question-timing clock --
+    # otherwise a socket that's still mid-reconnect right at match start (see
+    # BATTLE_DISCONNECT_NOTICE_DEBOUNCE_SECONDS's own note on queue.tsx's
+    # socket closing and match-session.tsx's reopening fresh around here)
+    # would silently eat into question 1's answerable window before the
+    # client was even present to render it. This bounds how long to wait for
+    # that confirmation once both sides ARE ready before just proceeding
+    # anyway -- the fallback for a REST-only client (mark_connected never
+    # fires for one that never opens a socket at all, by design still
+    # supported -- see app/api/routes/battle_ws.py's module docstring) and
+    # for the rare real connection that's delayed past this. Enforced by
+    # run_stale_match_reap_once, not a live timer -- see its docstring.
+    BATTLE_CONNECTION_READY_TIMEOUT_SECONDS: float = 8.0
     # Safety-net TTL for an abandoned ready hash (e.g. one side readies then
     # vanishes and the match is never cancelled/completed) -- not the
     # primary lifecycle mechanism.
     BATTLE_READY_TTL_SECONDS: int = 300
-    BATTLE_DISCONNECT_GRACE_PERIOD_SECONDS: float = 15.0
+    # Must comfortably outlast the mobile client's own reconnect backoff
+    # cycle (currently 1+2+4+8=15s cumulative before its last first-cycle
+    # attempt even fires -- see RECONNECT_DELAYS_MS in
+    # Mobile-Application/hooks/use-battle-match.tsx) plus handshake/DNS/Redis
+    # latency on top. At 15.0 an ordinary drop that needed the full backoff
+    # cycle to recover was racing this deadline with ~zero margin.
+    BATTLE_DISCONNECT_GRACE_PERIOD_SECONDS: float = 30.0
     # Extra Redis-key TTL margin beyond the grace period itself, so the key
     # outlives the deadline it encodes long enough for a late grace-check
     # task to still read it.
@@ -164,6 +204,13 @@ class Settings(BaseSettings):
     # (see battle_gameplay_service.bump_connection_generation) -- generous,
     # well past any realistic match duration, not the primary cleanup path.
     BATTLE_CONNECTION_GENERATION_TTL_SECONDS: int = 3600
+    # Delay before battle_connection_manager.py's supervisor restarts a
+    # match's progression timer after it dies from an unhandled exception
+    # (a transient DB/Redis error mid-tick, say) -- without this, one such
+    # error would silently freeze that match's question progression forever
+    # for anyone routed to this process, since the timer is only ever
+    # started once, on the first local connection.
+    BATTLE_PROGRESSION_TIMER_RESPAWN_DELAY_SECONDS: float = 2.0
 
     # ── Competitive Battle System: integration and hardening ───────────────
     # How long a match may sit at status="waiting" before the reaper treats
