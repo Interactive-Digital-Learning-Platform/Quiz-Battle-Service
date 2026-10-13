@@ -1,4 +1,5 @@
 import asyncio
+from typing import Annotated
 
 import jwt
 from fastapi import Depends, HTTPException, WebSocket, WebSocketException, status
@@ -99,6 +100,20 @@ async def get_current_user(
         )
 
     return await _verify_token(credentials.credentials)
+
+
+async def get_clerk_id(current_user: dict = Depends(get_current_user)) -> str:
+    # The Clerk user ID (`sub`) every user-scoped route keys on.
+    clerk_id: str = current_user.get("sub", "")
+    if not clerk_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is missing the 'sub' (user ID) claim.",
+        )
+    return clerk_id
+
+
+ClerkId = Annotated[str, Depends(get_clerk_id)]
 
 
 async def get_current_user_ws(websocket: WebSocket) -> dict:

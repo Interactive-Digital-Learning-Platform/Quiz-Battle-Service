@@ -1,13 +1,13 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.redis_client import get_redis
-from app.core.security import get_current_user
+from app.core.security import ClerkId
 from app.schemas.battle import (
     BattleAnalyticsResponse,
     BattleHistoryResponse,
@@ -19,7 +19,12 @@ from app.schemas.battle import (
     SubmitBattleAnswerRequest,
     SubmitBattleAnswerResponse,
 )
-from app.services import battle_analytics_service, battle_gameplay_service, battle_ws_events, matchmaking_service
+from app.services import (
+    battle_analytics_service,
+    battle_gameplay_service,
+    battle_ws_events,
+    matchmaking_service,
+)
 from app.services.battle_connection_manager import manager as ws_manager
 from app.services.battle_service import get_competitive_profile, get_leaderboard
 from app.services.user_service import get_or_create_user
@@ -43,6 +48,7 @@ router = APIRouter(prefix="/battle", tags=["Battle"])
     ),
 )
 async def get_battle_leaderboard(
+    clerk_id: ClerkId,
     subject: str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
     page_size: int = Query(
@@ -50,16 +56,8 @@ async def get_battle_leaderboard(
         ge=1,
         le=settings.BATTLE_LEADERBOARD_MAX_PAGE_SIZE,
     ),
-    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> LeaderboardResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     logger.info(
         "GET /battle/leaderboard — clerk_id=%s, subject=%s, page=%d", clerk_id, subject, page
     )
@@ -83,16 +81,9 @@ async def get_battle_leaderboard(
     ),
 )
 async def get_my_battle_profile(
-    current_user: dict = Depends(get_current_user),
+    clerk_id: ClerkId,
     db: AsyncSession = Depends(get_db),
 ) -> CompetitiveProfileResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     logger.info("GET /battle/profile — clerk_id=%s", clerk_id)
 
     user = await get_or_create_user(db, clerk_id)
@@ -114,16 +105,9 @@ async def get_my_battle_profile(
     ),
 )
 async def get_my_battle_analytics(
-    current_user: dict = Depends(get_current_user),
+    clerk_id: ClerkId,
     db: AsyncSession = Depends(get_db),
 ) -> BattleAnalyticsResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     logger.info("GET /battle/analytics — clerk_id=%s", clerk_id)
 
     user = await get_or_create_user(db, clerk_id)
@@ -144,6 +128,7 @@ async def get_my_battle_analytics(
     ),
 )
 async def get_my_battle_history(
+    clerk_id: ClerkId,
     subject: str | None = Query(None, min_length=1),
     page: int = Query(1, ge=1),
     page_size: int = Query(
@@ -151,16 +136,8 @@ async def get_my_battle_history(
         ge=1,
         le=settings.BATTLE_LEADERBOARD_MAX_PAGE_SIZE,
     ),
-    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> BattleHistoryResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     logger.info("GET /battle/history — clerk_id=%s, subject=%s, page=%d", clerk_id, subject, page)
 
     user = await get_or_create_user(db, clerk_id)
@@ -185,18 +162,11 @@ async def get_my_battle_history(
     ),
 )
 async def join_battle_queue(
+    clerk_id: ClerkId,
     payload: JoinQueueRequest,
-    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> QueueStatusResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     logger.info("POST /battle/queue/join — clerk_id=%s, subject=%s", clerk_id, payload.subject)
 
     user = await get_or_create_user(db, clerk_id)
@@ -216,17 +186,10 @@ async def join_battle_queue(
     ),
 )
 async def cancel_battle_queue(
-    current_user: dict = Depends(get_current_user),
+    clerk_id: ClerkId,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> QueueStatusResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     logger.info("POST /battle/queue/cancel — clerk_id=%s", clerk_id)
 
     user = await get_or_create_user(db, clerk_id)
@@ -247,17 +210,10 @@ async def cancel_battle_queue(
     ),
 )
 async def get_battle_queue_status(
-    current_user: dict = Depends(get_current_user),
+    clerk_id: ClerkId,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> QueueStatusResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     user = await get_or_create_user(db, clerk_id)
     data = await matchmaking_service.get_queue_status(db, redis, user_id=user.id)
     return QueueStatusResponse(**data)
@@ -280,18 +236,11 @@ async def get_battle_queue_status(
     ),
 )
 async def get_battle_match_state(
+    clerk_id: ClerkId,
     match_id: int,
-    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> BattleMatchStateResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     user = await get_or_create_user(db, clerk_id)
     data = await battle_gameplay_service.get_match_state(db, match_id=match_id, user_id=user.id, redis=redis)
     return BattleMatchStateResponse(**data)
@@ -315,19 +264,12 @@ async def get_battle_match_state(
     ),
 )
 async def submit_battle_match_answer(
+    clerk_id: ClerkId,
     match_id: int,
     payload: SubmitBattleAnswerRequest,
-    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> SubmitBattleAnswerResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     user = await get_or_create_user(db, clerk_id)
     data = await battle_gameplay_service.submit_battle_answer(
         db, match_id=match_id, user_id=user.id,
@@ -354,18 +296,11 @@ async def submit_battle_match_answer(
     ),
 )
 async def ready_battle_match(
+    clerk_id: ClerkId,
     match_id: int,
-    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> BattleMatchStateResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     user = await get_or_create_user(db, clerk_id)
     await battle_gameplay_service.mark_ready(db, redis, match_id=match_id, user_id=user.id)
     data = await battle_gameplay_service.get_match_state(db, match_id=match_id, user_id=user.id, redis=redis)
@@ -389,18 +324,11 @@ async def ready_battle_match(
     ),
 )
 async def forfeit_battle_match(
+    clerk_id: ClerkId,
     match_id: int,
-    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> BattleMatchStateResponse:
-    clerk_id: str = current_user.get("sub", "")
-    if not clerk_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the 'sub' (user ID) claim.",
-        )
-
     user = await get_or_create_user(db, clerk_id)
     match = await battle_gameplay_service.forfeit_match(
         db, redis, match_id=match_id, forfeiting_user_id=user.id

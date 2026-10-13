@@ -15,7 +15,6 @@ round-trip instead of a sorted-set-based sliding window.
 """
 from redis.asyncio import Redis
 
-
 # KEYS[1]=counter  ARGV[1]=window_seconds
 # INCR and the expiry in one atomic step. As two separate calls, a crash or
 # Redis blip between them left a counter with no TTL -- that user stayed

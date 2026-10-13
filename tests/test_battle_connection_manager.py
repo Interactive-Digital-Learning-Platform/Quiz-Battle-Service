@@ -28,7 +28,6 @@ async def test_clean_return_is_never_respawned():
     async def factory(_match_id: int, _stop_event: asyncio.Event) -> None:
         nonlocal calls
         calls += 1
-        return
 
     await manager._run_progression_timer_with_respawn(1, stop_event, factory)
     assert calls == 1
@@ -47,7 +46,7 @@ async def test_exception_triggers_a_restart(monkeypatch):
         calls += 1
         if calls < 3:
             raise RuntimeError("transient DB hiccup")
-        return  # third attempt succeeds cleanly -- supervisor stops here
+        # third attempt succeeds cleanly -- supervisor stops here
 
     await manager._run_progression_timer_with_respawn(1, stop_event, factory)
     assert calls == 3

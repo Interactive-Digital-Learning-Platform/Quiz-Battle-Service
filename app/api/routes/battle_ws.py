@@ -57,7 +57,6 @@ from app.schemas.battle_ws import (
     MatchStartedEvent,
     PlayerDisconnectedEvent,
     PlayerReconnectedEvent,
-    QuestionResultEvent,
     QuestionStartedEvent,
     StateSyncEvent,
     WSAnswerMessage,

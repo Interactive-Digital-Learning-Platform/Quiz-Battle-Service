@@ -1,11 +1,13 @@
 import asyncio
 import contextlib
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-import app.models  # noqa: F401 -- registers model metadata on Base
+import app.models
 from app.api.routes import battle, battle_ws
 from app.core.config import settings
 from app.core.database import Base, engine
@@ -20,31 +22,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    description=(
-        "Online 1v1 competitive quiz battle microservice — matchmaking, Elo "
-        "rating, subject leaderboards, and live WebSocket gameplay. Shares "
-        "its Postgres database with Personalized-Quiz-Service (real FKs "
-        "into users/questions) but is deployed and versioned independently."
-    ),
-    version="0.1.0",
-    docs_url="/docs" if settings.ENVIRONMENT == "development" else None,
-    redoc_url="/redoc" if settings.ENVIRONMENT == "development" else None,
-)
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if settings.ENVIRONMENT == "development" else [],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting %s [%s]", settings.PROJECT_NAME, settings.ENVIRONMENT)
 
     async with engine.begin() as conn:
@@ -69,23 +48,22 @@ async def on_startup() -> None:
     # matchmaking_service.run_in_match_reconcile_once).
     await matchmaking_service.clear_all_queue_state(redis_client)
 
-    app.state.matchmaking_sweep_task = asyncio.create_task(
+    _app.state.matchmaking_sweep_task = asyncio.create_task(
         matchmaking_service.start_matchmaking_sweep_loop()
     )
-    app.state.stale_match_reaper_task = asyncio.create_task(
+    _app.state.stale_match_reaper_task = asyncio.create_task(
         battle_gameplay_service.start_stale_match_reaper_loop()
     )
-    app.state.in_match_reconciler_task = asyncio.create_task(
+    _app.state.in_match_reconciler_task = asyncio.create_task(
         matchmaking_service.start_in_match_reconciler_loop()
     )
 
+    yield
 
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
     logger.info("Shutting down — disposing DB engine...")
 
     for task_attr in ("matchmaking_sweep_task", "stale_match_reaper_task", "in_match_reconciler_task"):
-        task = getattr(app.state, task_attr, None)
+        task = getattr(_app.state, task_attr, None)
         if task is not None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -94,6 +72,30 @@ async def on_shutdown() -> None:
     await redis_client.aclose()
     await engine.dispose()
     logger.info("Shutdown complete.")
+
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description=(
+        "Online 1v1 competitive quiz battle microservice — matchmaking, Elo "
+        "rating, subject leaderboards, and live WebSocket gameplay. Shares "
+        "its Postgres database with Personalized-Quiz-Service (real FKs "
+        "into users/questions) but is deployed and versioned independently."
+    ),
+    version="0.1.0",
+    docs_url="/docs" if settings.ENVIRONMENT == "development" else None,
+    redoc_url="/redoc" if settings.ENVIRONMENT == "development" else None,
+    lifespan=lifespan,
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if settings.ENVIRONMENT == "development" else [],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 API_PREFIX = "/api/v1"

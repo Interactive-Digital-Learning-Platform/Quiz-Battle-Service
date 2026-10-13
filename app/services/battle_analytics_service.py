@@ -15,7 +15,7 @@ Only status="completed" matches count (forfeits included -- they reuse
 get_battle_history. Answer-level stats only cover questions the player
 actually answered (see _answers_base).
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,7 +25,7 @@ from app.core.config import settings
 from app.models.battle_match import BattleAnswer, BattleMatch, BattleParticipant
 from app.models.question import Question
 
-_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+_EPOCH = datetime.min.replace(tzinfo=UTC)
 
 
 def _speed_tiers() -> list[tuple[str, float | None]]:
@@ -55,7 +55,7 @@ def _sort_key(finished_at: datetime | None, match_id: int) -> tuple[datetime, in
     if finished_at is None:
         return (_EPOCH, match_id)
     if finished_at.tzinfo is None:
-        finished_at = finished_at.replace(tzinfo=timezone.utc)
+        finished_at = finished_at.replace(tzinfo=UTC)
     return (finished_at, match_id)
 
 
