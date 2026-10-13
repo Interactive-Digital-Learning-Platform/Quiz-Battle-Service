@@ -150,6 +150,15 @@ class Settings(BaseSettings):
     BATTLE_STREAK_BONUS_TIER4_MIN_STREAK: int = 5
     BATTLE_STREAK_BONUS_TIER4_POINTS: int = 20
 
+    # ── Competitive Battle System: analytics (GET /battle/analytics) ───────
+    # Rating-history points returned per subject (most recent N matches).
+    BATTLE_ANALYTICS_RATING_HISTORY_LIMIT: int = 20
+    # Results shown as the "recent form" strip (most recent N matches).
+    BATTLE_ANALYTICS_RECENT_FORM_LIMIT: int = 10
+    # A lesson needs at least this many battle answers before it's reported
+    # as a strong/weak topic -- one or two answers say nothing.
+    BATTLE_ANALYTICS_TOPIC_MIN_ANSWERS: int = 3
+
     # ── Competitive Battle System: realtime communication ──────────────────
     # WebSocket live layer over the REST engine -- REST endpoints keep
     # working standalone (POST .../ready replaces the removed

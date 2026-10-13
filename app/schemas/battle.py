@@ -229,3 +229,71 @@ class SubmitBattleAnswerResponse(BaseModel):
     # freely (resubmitted) any number of times before the question locks.
     question_id: int
     selected_option: str
+
+
+# ── GET /battle/analytics ────────────────────────────────────────────────────
+# See app/services/battle_analytics_service.py for how each figure is derived.
+
+
+class BattleRatingPoint(BaseModel):
+    match_id: int
+    finished_at: datetime | None
+    rating: int  # rating_after for this match
+    rating_change: int | None
+    result: str | None
+
+
+class BattleRatingHistory(BaseModel):
+    subject: str
+    # Oldest -> newest, at most BATTLE_ANALYTICS_RATING_HISTORY_LIMIT points.
+    points: list[BattleRatingPoint]
+
+
+class BattleSpeedTier(BaseModel):
+    # "fast" | "quick" | "steady" | "slow" -- the speed-bonus tiers, fastest first.
+    tier: str
+    max_seconds: float | None  # inclusive upper bound; None for the open-ended last tier
+    answered: int
+    correct: int
+
+
+class BattlePointsBreakdown(BaseModel):
+    base: int
+    speed_bonus: int
+    streak_bonus: int
+
+
+class BattleTopicStat(BaseModel):
+    subject: str
+    lesson: str
+    answered: int
+    correct: int
+    accuracy: float
+
+
+class BattleStrongerOpponents(BaseModel):
+    # Matches against an opponent rated higher than the user going in.
+    played: int
+    wins: int
+
+
+class BattleAnalyticsResponse(BaseModel):
+    matches_played: int
+    wins: int
+    losses: int
+    draws: int
+    forfeits: int
+    win_rate: float
+    average_score: float
+    answered: int
+    correct: int
+    accuracy: float
+    # Oldest -> newest, at most BATTLE_ANALYTICS_RECENT_FORM_LIMIT results.
+    recent_form: list[str]
+    # One entry per subject played, most-played subject first.
+    rating_history: list[BattleRatingHistory]
+    speed_profile: list[BattleSpeedTier]
+    points: BattlePointsBreakdown
+    # Lessons with at least BATTLE_ANALYTICS_TOPIC_MIN_ANSWERS answers, strongest first.
+    topics: list[BattleTopicStat]
+    vs_stronger: BattleStrongerOpponents

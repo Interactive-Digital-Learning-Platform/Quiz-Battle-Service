@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.core.redis_client import get_redis
 from app.core.security import get_current_user
 from app.schemas.battle import (
+    BattleAnalyticsResponse,
     BattleHistoryResponse,
     BattleMatchStateResponse,
     CompetitiveProfileResponse,
@@ -18,7 +19,7 @@ from app.schemas.battle import (
     SubmitBattleAnswerRequest,
     SubmitBattleAnswerResponse,
 )
-from app.services import battle_gameplay_service, battle_ws_events, matchmaking_service
+from app.services import battle_analytics_service, battle_gameplay_service, battle_ws_events, matchmaking_service
 from app.services.battle_connection_manager import manager as ws_manager
 from app.services.battle_service import get_competitive_profile, get_leaderboard
 from app.services.user_service import get_or_create_user
@@ -97,6 +98,37 @@ async def get_my_battle_profile(
     user = await get_or_create_user(db, clerk_id)
     subjects = await get_competitive_profile(db, user_id=user.id)
     return CompetitiveProfileResponse(user_id=user.id, subjects=subjects)
+
+
+@router.get(
+    "/analytics",
+    response_model=BattleAnalyticsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="My battle analytics",
+    description=(
+        "Aggregated stats over the authenticated user's completed battles: "
+        "record and recent form, per-subject rating history, answer speed "
+        "profile, points breakdown, strongest/weakest lessons and results "
+        "against higher-rated opponents. All-zero / empty lists for a user "
+        "who hasn't finished a battle yet."
+    ),
+)
+async def get_my_battle_analytics(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> BattleAnalyticsResponse:
+    clerk_id: str = current_user.get("sub", "")
+    if not clerk_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is missing the 'sub' (user ID) claim.",
+        )
+
+    logger.info("GET /battle/analytics — clerk_id=%s", clerk_id)
+
+    user = await get_or_create_user(db, clerk_id)
+    data = await battle_analytics_service.get_battle_analytics(db, user_id=user.id)
+    return BattleAnalyticsResponse(**data)
 
 
 @router.get(
