@@ -267,6 +267,14 @@ class Settings(BaseSettings):
     BATTLE_QUEUE_JOIN_RATE_LIMIT_WINDOW_SECONDS: int = 10
     BATTLE_WS_CONNECT_RATE_LIMIT_MAX_CALLS: int = 10
     BATTLE_WS_CONNECT_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    # Comma-separated subjects players may queue for (exact names, e.g. "Mathematics,Science"). Every queued subject
+    # gets its own rating row, Redis queue and AI-generated questions, so production should pin this to the app's
+    # subject list. Empty = any subject (development).
+    BATTLE_ALLOWED_SUBJECTS: str = ""
+
+    @property
+    def battle_allowed_subjects(self) -> set[str]:
+        return {s.strip() for s in self.BATTLE_ALLOWED_SUBJECTS.split(",") if s.strip()}
 
     model_config = SettingsConfigDict(
         env_file=".env",

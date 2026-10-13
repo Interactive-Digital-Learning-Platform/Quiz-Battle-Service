@@ -11,6 +11,7 @@ elo_engine.compute_elo_update() and updates rows here.
 import math
 
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -199,13 +200,27 @@ async def get_or_create_subject_rating(
     if row is not None:
         return row
 
-    row = CompetitiveSubjectRating(
-        user_id=user_id,
-        subject=subject,
-        rating=settings.BATTLE_INITIAL_RATING,
-        highest_rating=settings.BATTLE_INITIAL_RATING,
-    )
-    db.add(row)
+    try:
+        # Savepoint: a double-tapped "Find a battle" can race two first-time
+        # joins for the same subject into the (user_id, subject) unique key.
+        async with db.begin_nested():
+            row = CompetitiveSubjectRating(
+                user_id=user_id,
+                subject=subject,
+                rating=settings.BATTLE_INITIAL_RATING,
+                highest_rating=settings.BATTLE_INITIAL_RATING,
+            )
+            db.add(row)
+    except IntegrityError:
+        return (
+            await db.execute(
+                select(CompetitiveSubjectRating).where(
+                    CompetitiveSubjectRating.user_id == user_id,
+                    CompetitiveSubjectRating.subject == subject,
+                )
+            )
+        ).scalar_one()
+
     await db.commit()
     await db.refresh(row)
     return row

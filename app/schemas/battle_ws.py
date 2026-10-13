@@ -19,7 +19,7 @@ class WSReadyMessage(BaseModel):
 class WSAnswerMessage(BaseModel):
     type: Literal["answer"] = "answer"
     question_id: int
-    selected_option: str = Field(..., min_length=1)
+    selected_option: str = Field(..., min_length=1, max_length=512)  # see SubmitBattleAnswerRequest
 
 
 class WSForfeitMessage(BaseModel):

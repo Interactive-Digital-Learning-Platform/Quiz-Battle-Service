@@ -5,6 +5,7 @@
 import logging
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
@@ -17,11 +18,21 @@ async def get_or_create_user(db: AsyncSession, clerk_id: str) -> User:
     result = await db.execute(stmt)
     user = result.scalar_one_or_none()
 
-    if user is None:
-        logger.info("First login — creating user record for clerk_id=%s", clerk_id)
-        user = User(clerk_id=clerk_id)
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
+    if user is not None:
+        return user
 
+    logger.info("First login — creating user record for clerk_id=%s", clerk_id)
+    try:
+        # Savepoint: a concurrent first request (REST call + WS connect, or the
+        # quiz service) can insert the same clerk_id between our SELECT and
+        # INSERT. Only this insert rolls back; the caller's transaction survives.
+        async with db.begin_nested():
+            user = User(clerk_id=clerk_id)
+            db.add(user)
+    except IntegrityError:
+        logger.info("User for clerk_id=%s was created concurrently — reusing it", clerk_id)
+        return (await db.execute(stmt)).scalar_one()
+
+    await db.commit()
+    await db.refresh(user)
     return user
