@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
@@ -42,6 +43,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
@@ -499,6 +501,36 @@ def _apply_result(
     participant.result = label
 
 
+async def _is_rated_pairing(db: AsyncSession, *, match: BattleMatch, user_a_id: int, user_b_id: int) -> bool:
+    """False once these two players have already completed
+    BATTLE_REPEAT_OPPONENT_RATED_LIMIT other matches against each other in the
+    last BATTLE_REPEAT_OPPONENT_WINDOW_HOURS (any subject) -- see that setting.
+    `match` itself is excluded: it's already flipped to "completed" inside the
+    caller's transaction by the time this runs.
+    """
+    cutoff = datetime.now(UTC) - timedelta(hours=settings.BATTLE_REPEAT_OPPONENT_WINDOW_HOURS)
+    p_a, p_b = aliased(BattleParticipant), aliased(BattleParticipant)
+    previous = (
+        await db.execute(
+            select(func.count(BattleMatch.id))
+            .join(p_a, (p_a.match_id == BattleMatch.id) & (p_a.user_id == user_a_id))
+            .join(p_b, (p_b.match_id == BattleMatch.id) & (p_b.user_id == user_b_id))
+            .where(
+                BattleMatch.id != match.id,
+                BattleMatch.status == "completed",
+                BattleMatch.finished_at >= cutoff,
+            )
+        )
+    ).scalar_one()
+    rated = previous < settings.BATTLE_REPEAT_OPPONENT_RATED_LIMIT
+    if not rated:
+        logger.info(
+            "Battle match %d unrated — users %d and %d already played %d times in the last %dh",
+            match.id, user_a_id, user_b_id, previous, settings.BATTLE_REPEAT_OPPONENT_WINDOW_HOURS,
+        )
+    return rated
+
+
 async def _finalize_match(db: AsyncSession, match: BattleMatch, redis: Redis | None = None) -> BattleMatch:
     now = datetime.now(UTC)
     claim_stmt = (
@@ -533,6 +565,9 @@ async def _finalize_match(db: AsyncSession, match: BattleMatch, redis: Redis | N
     rating_b = await _get_or_build_rating_no_commit(db, user_id=p_b.user_id, subject=match.subject)
 
     elo = compute_elo_update(rating_a.rating, rating_b.rating, winner.result_for_a)
+    rated = await _is_rated_pairing(db, match=match, user_a_id=p_a.user_id, user_b_id=p_b.user_id)
+    new_rating_a = elo.new_rating_a if rated else rating_a.rating
+    new_rating_b = elo.new_rating_b if rated else rating_b.rating
 
     best_streak_a = await _best_streak_for(db, match_id=match.id, user_id=p_a.user_id)
     best_streak_b = await _best_streak_for(db, match_id=match.id, user_id=p_b.user_id)
@@ -541,11 +576,11 @@ async def _finalize_match(db: AsyncSession, match: BattleMatch, redis: Redis | N
     result_a = _result_label(winner.winner_user_id, p_a.user_id, is_draw=is_draw)
     result_b = _result_label(winner.winner_user_id, p_b.user_id, is_draw=is_draw)
     _apply_result(
-        rating_a, p_a, outcome_a, answers_a, new_rating=elo.new_rating_a,
+        rating_a, p_a, outcome_a, answers_a, new_rating=new_rating_a,
         stat_bucket=result_a, label=result_a, best_streak=best_streak_a,
     )
     _apply_result(
-        rating_b, p_b, outcome_b, answers_b, new_rating=elo.new_rating_b,
+        rating_b, p_b, outcome_b, answers_b, new_rating=new_rating_b,
         stat_bucket=result_b, label=result_b, best_streak=best_streak_b,
     )
 
@@ -574,16 +609,18 @@ async def forfeit_match(
     if match.status not in _ACTIVE_STATUSES:
         return match  # idempotent no-op -- already resolved
 
-    # "waiting" == matched but not yet both-ready -- no question has ever
-    # been shown to either player, so there's nothing to score. Void the
-    # match instead of recording a scored forfeit, and let the remaining
-    # player's client auto-requeue off the resulting match_cancelled event
-    # (see queue.tsx) rather than dead-ending on a "you won" screen for a
-    # match that never actually started.
-    if match.status == "waiting":
-        return await _cancel_waiting_match(db, redis, match=match, participants=participants)
-
+    # "waiting" (matched but not yet both-ready) or a countdown that hasn't
+    # reached started_at yet -- no question has been shown to either player,
+    # so there's nothing to score. Void the match instead of recording a
+    # scored forfeit (which used to cost the leaver rating for a match that
+    # never began), and let the remaining player's client auto-requeue off
+    # the resulting match_cancelled event (see queue.tsx) rather than
+    # dead-ending on a "you won" screen. A countdown whose started_at has
+    # passed is really "active" (the flip is lazy) and is scored below.
     now = datetime.now(UTC)
+    if match.status == "waiting" or (match.status == "countdown" and now < as_utc(match.started_at)):
+        return await _cancel_unstarted_match(db, redis, match=match, participants=participants, now=now)
+
     claim_stmt = (
         update(BattleMatch)
         .where(BattleMatch.id == match.id, BattleMatch.status.in_(_ACTIVE_STATUSES))
@@ -609,17 +646,20 @@ async def forfeit_match(
 
     result_for_a = elo_engine.RESULT_LOSS if forfeiter is p_a else elo_engine.RESULT_WIN
     elo = compute_elo_update(rating_a.rating, rating_b.rating, result_for_a)
+    rated = await _is_rated_pairing(db, match=match, user_a_id=p_a.user_id, user_b_id=p_b.user_id)
+    new_rating_a = elo.new_rating_a if rated else rating_a.rating
+    new_rating_b = elo.new_rating_b if rated else rating_b.rating
 
     best_streak_a = await _best_streak_for(db, match_id=match.id, user_id=p_a.user_id)
     best_streak_b = await _best_streak_for(db, match_id=match.id, user_id=p_b.user_id)
 
     _apply_result(
-        rating_a, p_a, outcome_a, answers_a, new_rating=elo.new_rating_a,
+        rating_a, p_a, outcome_a, answers_a, new_rating=new_rating_a,
         stat_bucket=("loss" if forfeiter is p_a else "win"),
         label=("forfeit" if forfeiter is p_a else "win"), best_streak=best_streak_a,
     )
     _apply_result(
-        rating_b, p_b, outcome_b, answers_b, new_rating=elo.new_rating_b,
+        rating_b, p_b, outcome_b, answers_b, new_rating=new_rating_b,
         stat_bucket=("loss" if forfeiter is p_b else "win"),
         label=("forfeit" if forfeiter is p_b else "win"), best_streak=best_streak_b,
     )
@@ -636,14 +676,25 @@ async def forfeit_match(
     return match
 
 
-async def _cancel_waiting_match(
-    db: AsyncSession, redis: Redis, *, match: BattleMatch, participants: list[BattleParticipant]
+async def _cancel_unstarted_match(
+    db: AsyncSession, redis: Redis, *, match: BattleMatch, participants: list[BattleParticipant],
+    now: datetime,
 ) -> BattleMatch:
+    # Exactly-once like every other transition: only claims a match that is
+    # still waiting, or still counting down with started_at in the future
+    # (so a forfeit racing the countdown->active flip can't void a match
+    # that has just begun).
+    not_started = (BattleMatch.status == "waiting") | (
+        (BattleMatch.status == "countdown") & (BattleMatch.started_at > now)
+    )
     claim_stmt = (
         update(BattleMatch)
-        .where(BattleMatch.id == match.id, BattleMatch.status == "waiting")
+        .where(BattleMatch.id == match.id, not_started)
         .values(status="cancelled", cancel_reason=CANCEL_REASON_OPPONENT_LEFT_BEFORE_START)
         .returning(BattleMatch.id)
+        # No in-Python re-evaluation of the WHERE (it would compare a naive
+        # SQLite datetime against `now`); `match` is refreshed below instead.
+        .execution_options(synchronize_session=False)
     )
     claimed = (await db.execute(claim_stmt)).scalar_one_or_none()
     if claimed is None:
@@ -794,7 +845,19 @@ async def question_payload_for(db: AsyncSession, match: BattleMatch, order: int)
     if row is None:
         return None
     _mq, question = row
-    return {"question_id": question.id, "question": question.question, "options": question.options}
+    return {"question_id": question.id, "question": question.question, "options": _match_option_order(match, question)}
+
+
+def _match_option_order(match: BattleMatch, question: Question) -> list:
+    """The question's options in a per-match order. Pool questions recur
+    across matches, so a fixed order lets regulars learn "it's always B"
+    without reading the question. Seeded by (match, question) so both players
+    -- and any reconnect -- see the same order; grading compares the chosen
+    option's text, never its position, so the shuffle is invisible to it.
+    """
+    options = list(question.options or [])
+    random.Random(f"{match.id}:{question.id}").shuffle(options)
+    return options
 
 
 async def _progress_answers(db: AsyncSession, *, match_id: int, user_id: int) -> list[dict]:
@@ -1390,7 +1453,45 @@ async def _force_activate_stalled_ready_matches(db: AsyncSession, redis: Redis, 
     return forced_ids
 
 
+async def _settle_finished_unattended_matches(db: AsyncSession, redis: Redis) -> tuple[list[int], list[int]]:
+    """Active matches whose time budget (+ buffer) has run out with nobody
+    connected to trigger completion. Grades every slot the progression timer
+    never reached (idempotent -- already-graded slots are read back), then
+    either finalizes normally (someone answered at least one question, so
+    there's a real result to award) or cancels (nobody played at all).
+    Returns (settled_ids, abandoned_ids).
+    """
+    budget = settings.BATTLE_QUESTION_COUNT * settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
+    cutoff = datetime.now(UTC) - timedelta(seconds=budget + settings.BATTLE_FINISHED_MATCH_SETTLE_BUFFER_SECONDS)
+    matches = (
+        await db.execute(select(BattleMatch).where(BattleMatch.status == "active", BattleMatch.started_at < cutoff))
+    ).scalars().all()
+
+    settled: list[int] = []
+    abandoned: list[int] = []
+    for match in matches:
+        for order in range(settings.BATTLE_QUESTION_COUNT):
+            await _grade_and_reveal_question(db, redis, match=match, order=order)
+        anyone_answered = (
+            await db.execute(
+                select(func.count()).select_from(BattleAnswer).where(
+                    BattleAnswer.match_id == match.id, BattleAnswer.selected_option != ""
+                )
+            )
+        ).scalar_one() > 0
+        if anyone_answered:
+            finished = await _finalize_match(db, match, redis)
+            if finished.status == "completed":
+                settled.append(match.id)
+                logger.info("Battle match %d settled by the reaper — nobody was connected at the end.", match.id)
+        else:
+            abandoned.append(match.id)
+    return settled, abandoned
+
+
 async def run_stale_match_reap_once(db: AsyncSession, redis: Redis) -> int:
+    settled_ids, abandoned_ids = await _settle_finished_unattended_matches(db, redis)
+
     waiting_cutoff = datetime.now(UTC) - timedelta(seconds=settings.BATTLE_ORPHANED_MATCH_REAP_AFTER_SECONDS)
     waiting_ids = (
         await db.execute(
@@ -1399,13 +1500,18 @@ async def run_stale_match_reap_once(db: AsyncSession, redis: Redis) -> int:
     ).scalars().all()
 
     active_cutoff = datetime.now(UTC) - timedelta(seconds=settings.BATTLE_ACTIVE_MATCH_REAP_AFTER_SECONDS)
-    active_ids = (
-        await db.execute(
-            select(BattleMatch.id).where(
-                BattleMatch.status.in_(_STALE_ACTIVE_STATUSES), BattleMatch.started_at < active_cutoff
+    active_ids = [
+        *abandoned_ids,
+        *(
+            await db.execute(
+                select(BattleMatch.id).where(
+                    BattleMatch.status.in_(_STALE_ACTIVE_STATUSES),
+                    BattleMatch.started_at < active_cutoff,
+                    BattleMatch.id.notin_(abandoned_ids),
+                )
             )
-        )
-    ).scalars().all()
+        ).scalars().all(),
+    ]
 
     stale_ids = [*waiting_ids, *active_ids]
     if stale_ids:
@@ -1430,7 +1536,7 @@ async def run_stale_match_reap_once(db: AsyncSession, redis: Redis) -> int:
             logger.warning("Battle match %d reaped -- stale and abandoned, no rating changes applied.", match_id)
 
     forced_ids = await _force_activate_stalled_ready_matches(db, redis, skip_ids=set(waiting_ids))
-    return len(stale_ids) + len(forced_ids)
+    return len(settled_ids) + len(stale_ids) + len(forced_ids)
 
 
 async def start_stale_match_reaper_loop() -> None:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -61,6 +62,72 @@ async def _create_chat_completion_with_retry(
     raise last_exc
 
 
+# Column limits the generated rows must fit: questions.correct_answer and
+# battle_answers.selected_option are String(512) -- a longer option couldn't be
+# stored as the answer, nor picked by a player (submissions are capped at 512)
+# -- and questions.lesson is String(255). One over-long value used to fail the
+# whole batch's commit.
+_MAX_OPTION_LENGTH = 512
+_MAX_LESSON_LENGTH = 255
+
+
+def _checked_correct_answer(
+    question_text: str, options: object, correct: str, *, index: int, kind: str,
+) -> str | None:
+    """Shared shape check for generated questions (kept in step with
+    Personalized-Quiz-Service's copy). Returns the correct answer (normalised
+    to the matching option's exact text) or None if the question should be
+    dropped -- the caller's retry loop tops up any shortfall rather than us
+    patching a bad question up:
+
+    - exactly 4 non-empty string options, each at most _MAX_OPTION_LENGTH
+      (Groq occasionally returns 5+, or non-string values);
+    - no two options the same ignoring case/whitespace -- battle grading is
+      case-insensitive, so duplicates would make two picks "correct";
+    - correct_answer matches an option (exact, else case/whitespace-insensitive) --
+      never default to options[0] and mislabel a wrong answer as correct.
+    """
+    if (
+        not question_text
+        or not isinstance(options, list)
+        or len(options) != 4
+        or not all(isinstance(o, str) and o.strip() and len(o) <= _MAX_OPTION_LENGTH for o in options)
+    ):
+        logger.warning(
+            "Skipping malformed %s at index %d: expected 4 non-empty options of at most %d chars, got %r",
+            kind, index, _MAX_OPTION_LENGTH, options,
+        )
+        return None
+
+    normalised = [o.strip().lower() for o in options]
+    if len(set(normalised)) != len(normalised):
+        logger.warning("Skipping %s at index %d: duplicate options %r", kind, index, options)
+        return None
+
+    if correct in options:
+        return correct
+    try:
+        return options[normalised.index(correct.strip().lower())]
+    except ValueError:
+        logger.warning(
+            "Skipping %s at index %d: correct_answer %r not found in options %r",
+            kind, index, correct, options,
+        )
+        return None
+
+
+_PROMPT_UNSAFE_CHARS = re.compile(r"[^\w &(),./'-]")
+
+
+def _prompt_safe(text: str, *, max_length: int = 100) -> str:
+    """A subject/lesson name as it goes into the prompt: one line, plain name
+    characters only, capped. Strips the newlines, quotes, brackets and the
+    like an injected instruction ("...\n\nIgnore the syllabus and...")
+    would need to break out of its field."""
+    text = _PROMPT_UNSAFE_CHARS.sub(" ", text)
+    return " ".join(text.split())[:max_length]
+
+
 async def generate_questions(
     grade: int,
     subject: str,
@@ -94,6 +161,9 @@ async def generate_questions(
     existing_questions = existing_questions or []
     avoid_lessons = avoid_lessons or []
     random_lessons = lesson is None
+    subject = _prompt_safe(subject)
+    if lesson is not None:
+        lesson = _prompt_safe(lesson, max_length=255)
 
     system_prompt = """You are an expert educational content creator for Sri Lankan school students.
 Your task is to generate UNIQUE, DIVERSE multiple-choice quiz questions.
@@ -253,33 +323,11 @@ QUALITY RULES:
         options = q.get("options", [])
         correct = str(q.get("correct_answer", "")).strip()
         explanation = str(q.get("explanation", "")).strip()
-        q_lesson = lesson if lesson else (str(q.get("lesson", "")).strip() or subject)
+        q_lesson = (lesson if lesson else (str(q.get("lesson", "")).strip() or subject))[:_MAX_LESSON_LENGTH]
 
-        # Must have exactly 4 options (Groq occasionally ignores that rule
-        # and returns 5+). Truncating to 4 risks losing the actual correct
-        # answer, so a bad-count question is dropped entirely rather than
-        # patched up — the caller's retry loop tops up the shortfall.
-        if not question_text or not isinstance(options, list) or len(options) != 4:
-            logger.warning(
-                "Skipping malformed question at index %d: expected 4 options, got %d",
-                i, len(options) if isinstance(options, list) else 0,
-            )
+        correct = _checked_correct_answer(question_text, options, correct, index=i, kind="question")
+        if correct is None:
             continue
-
-        # correct_answer has to actually match one of the options (exact, or
-        # case/whitespace-insensitive). If it matches neither, there's no way
-        # to know which option is really correct — dropping it beats the old
-        # behavior of defaulting to options[0] and mislabeling a wrong answer
-        # as correct.
-        if correct not in options:
-            match = next((o for o in options if o.strip().lower() == correct.strip().lower()), None)
-            if match is None:
-                logger.warning(
-                    "Skipping question at index %d: correct_answer %r not found in options %r",
-                    i, correct, options,
-                )
-                continue
-            correct = match
 
         validated.append({
             "question": question_text,
@@ -477,24 +525,11 @@ QUALITY RULES:
         options = q.get("options", [])
         correct = str(q.get("correct_answer", "")).strip()
         explanation = str(q.get("explanation", "")).strip()
-        question_lesson = str(q.get("lesson", "")).strip() or subject
+        question_lesson = (str(q.get("lesson", "")).strip() or subject)[:_MAX_LESSON_LENGTH]
 
-        if not question_text or not isinstance(options, list) or len(options) != 4:
-            logger.warning(
-                "Skipping malformed shuffle question at index %d: expected 4 options, got %d",
-                i, len(options) if isinstance(options, list) else 0,
-            )
+        correct = _checked_correct_answer(question_text, options, correct, index=i, kind="shuffle question")
+        if correct is None:
             continue
-
-        if correct not in options:
-            match = next((o for o in options if o.strip().lower() == correct.strip().lower()), None)
-            if match is None:
-                logger.warning(
-                    "Skipping shuffle question at index %d: correct_answer %r not found in options %r",
-                    i, correct, options,
-                )
-                continue
-            correct = match
 
         validated.append({
             "subject": subject,

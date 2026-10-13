@@ -127,10 +127,16 @@ async def get_current_user_ws(websocket: WebSocket) -> dict:
     if settings.ENVIRONMENT == "development" and settings.AUTH_BYPASS:
         return _dev_bypass_identity()
 
-    token = websocket.query_params.get("token")
+    # Preferred: `Authorization: Bearer <jwt>` on the handshake (the mobile app sets it via React Native's
+    # WebSocket headers option) -- headers stay out of access logs. `?token=` is only a fallback for clients that
+    # can't set handshake headers (browsers, older app builds); app.core.log_redaction scrubs it from our logs.
+    scheme, _, header_token = websocket.headers.get("authorization", "").partition(" ")
+    token = header_token.strip() if scheme.lower() == "bearer" else ""
+    token = token or websocket.query_params.get("token")
     if not token:
         raise WebSocketException(
-            code=status.WS_1008_POLICY_VIOLATION, reason="Missing 'token' query parameter."
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="Missing token: send 'Authorization: Bearer <token>' (or the 'token' query parameter).",
         )
 
     try:

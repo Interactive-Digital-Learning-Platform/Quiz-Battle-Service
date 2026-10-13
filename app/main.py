@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import app.models
 from app.api.routes import battle, battle_ws
+from app.core import log_redaction
 from app.core.config import settings
 from app.core.database import Base, engine
 from app.core.redis_client import redis_client
@@ -20,6 +21,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+log_redaction.install()
 
 
 @asynccontextmanager

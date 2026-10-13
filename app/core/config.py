@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     # can't push rating negative. Purely defensive -- normal K=32 play
     # essentially never reaches it.
     BATTLE_MIN_RATING: int = 0
+    # Anti-farming: only the first N completed matches between the same two
+    # players within the window move either player's rating. Later ones still
+    # record the result (wins/losses, history) but leave ratings unchanged --
+    # stops someone queueing a second account into a quiet subject and
+    # forfeiting it over and over to pump their main's rating.
+    BATTLE_REPEAT_OPPONENT_RATED_LIMIT: int = 3
+    BATTLE_REPEAT_OPPONENT_WINDOW_HOURS: int = 24
 
     # League thresholds -- minimum rating (inclusive) to be in that league.
     # Below BATTLE_LEAGUE_SILVER_MIN is Bronze. Keep these strictly
@@ -126,6 +133,12 @@ class Settings(BaseSettings):
     BATTLE_POOL_MIN_SIZE: int = 20
     BATTLE_POOL_TARGET_SIZE: int = 60
     BATTLE_POOL_TOPUP_MAX_BATCH: int = 20
+    # Hard cap per (subject, difficulty) for "grow" top-ups -- the extra
+    # batches requested once a match had to serve already-seen questions
+    # because the pair had exhausted the never-seen pool. Keeps regular
+    # players from memorising a fixed ~60-question set, while bounding the
+    # Groq spend.
+    BATTLE_POOL_MAX_SIZE: int = 300
 
     # Base correct score -- wrong answer is always 0, never negative.
     BATTLE_SCORE_BASE_CORRECT: int = 100
@@ -252,6 +265,14 @@ class Settings(BaseSettings):
     # reap a match someone is actually still playing -- it only shortens how
     # long an abandoned one blocks its players.
     BATTLE_ACTIVE_MATCH_REAP_AFTER_SECONDS: float = 600.0
+    # An "active" match nobody is connected to anymore once its whole time
+    # budget (BATTLE_QUESTION_COUNT * BATTLE_QUESTION_TIME_LIMIT_SECONDS) plus
+    # this buffer has passed gets settled by the reaper: remaining questions
+    # graded, result and rating changes applied as if someone had been there
+    # to see it end -- so a winner whose opponent (and then they themselves)
+    # closed the app still gets the win. Only a match where neither player
+    # ever answered anything is cancelled as abandoned instead.
+    BATTLE_FINISHED_MATCH_SETTLE_BUFFER_SECONDS: float = 30.0
     # How often to cross-check every "in_match" Redis pointer against its
     # match's actual Postgres status (matchmaking_service.py's
     # run_in_match_reconcile_once) -- self-heals a user permanently stuck
@@ -274,10 +295,13 @@ class Settings(BaseSettings):
     # question, so anything above this is a buggy or abusive client.
     BATTLE_WS_MESSAGE_RATE_LIMIT_MAX_CALLS: int = 10
     BATTLE_WS_MESSAGE_RATE_LIMIT_WINDOW_SECONDS: float = 2.0
-    # Comma-separated subjects players may queue for (exact names, e.g. "Mathematics,Science"). Every queued subject
-    # gets its own rating row, Redis queue and AI-generated questions, so production should pin this to the app's
-    # subject list. Empty = any subject (development).
-    BATTLE_ALLOWED_SUBJECTS: str = ""
+    # Comma-separated subjects players may queue for (exact names). Every queued subject gets its own rating row,
+    # Redis queue and AI-generated questions written to the shared question pool, and the name is part of the AI
+    # prompt -- so free text here would let a player steer what Groq writes into that pool. Defaults to the mobile
+    # app's subject picker (constants/quizStyles.ts SUBJECT_ICONS); keep the two in sync. Empty = any subject.
+    BATTLE_ALLOWED_SUBJECTS: str = (
+        "Mathematics,Science,History,English,Geography,ICT,Health and Physical Education"
+    )
 
     @property
     def battle_allowed_subjects(self) -> set[str]:
