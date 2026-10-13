@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     CLERK_JWKS_URL: str
     CLERK_ISSUER: str
     CLERK_AUDIENCE: str | None = None
+    # Comma-separated origins allowed as a token's `azp` claim (e.g. "https://app.example.com"). Empty = no check.
+    CLERK_AUTHORIZED_PARTIES: str = ""
     AUTH_BYPASS: bool = False
 
     # ── Competitive Battle System: rating/leaderboard ──────────────────────
@@ -267,6 +269,11 @@ class Settings(BaseSettings):
     BATTLE_QUEUE_JOIN_RATE_LIMIT_WINDOW_SECONDS: int = 10
     BATTLE_WS_CONNECT_RATE_LIMIT_MAX_CALLS: int = 10
     BATTLE_WS_CONNECT_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    # Per-socket inbound message cap (in-process sliding window). Each answer
+    # message costs several DB queries; a real client sends a handful per
+    # question, so anything above this is a buggy or abusive client.
+    BATTLE_WS_MESSAGE_RATE_LIMIT_MAX_CALLS: int = 10
+    BATTLE_WS_MESSAGE_RATE_LIMIT_WINDOW_SECONDS: float = 2.0
     # Comma-separated subjects players may queue for (exact names, e.g. "Mathematics,Science"). Every queued subject
     # gets its own rating row, Redis queue and AI-generated questions, so production should pin this to the app's
     # subject list. Empty = any subject (development).

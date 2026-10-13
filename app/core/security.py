@@ -1,3 +1,5 @@
+import asyncio
+
 import jwt
 from fastapi import Depends, HTTPException, WebSocket, WebSocketException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -19,7 +21,9 @@ async def _verify_token(token: str) -> dict:
     # translate them into whatever their transport needs (get_current_user_ws
     # turns them into a WebSocketException).
     try:
-        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        # PyJWKClient fetches the JWKS with blocking urllib on a cache miss / key rotation; off the event loop
+        # so one slow Clerk round-trip doesn't stall every live battle socket on this process.
+        signing_key = await asyncio.to_thread(_jwks_client.get_signing_key_from_jwt, token)
 
         payload: dict = jwt.decode(
             token,
@@ -49,6 +53,17 @@ async def _verify_token(token: str) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid token: {exc}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Clerk session tokens carry `azp` (the origin that requested them). When CLERK_AUTHORIZED_PARTIES is set,
+    # only tokens minted for those origins are accepted; native-app tokens may have no azp, which is allowed.
+    allowed = {p.strip() for p in settings.CLERK_AUTHORIZED_PARTIES.split(",") if p.strip()}
+    azp = payload.get("azp")
+    if allowed and azp and azp not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token: unexpected authorized party.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 

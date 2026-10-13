@@ -1156,6 +1156,10 @@ async def submit_battle_answer(
     current_question = await question_payload_for(db, match, current_order)
     if current_question is None or current_question["question_id"] != question_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This is not the current question.")
+    # The pick locks once the reveal phase starts, whether or not the grading
+    # timer has run yet -- otherwise a lagging timer would let a late answer in.
+    if _question_time_remaining_seconds(match, current_order) <= settings.BATTLE_ANSWER_REVEAL_SECONDS:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Answers are locked for this question.")
 
     already_graded = (
         await db.execute(

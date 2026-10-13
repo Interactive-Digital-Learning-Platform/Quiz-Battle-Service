@@ -28,11 +28,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
+from collections import deque
 from datetime import UTC, datetime
 
 from fastapi import (
     APIRouter,
     Depends,
+    HTTPException,
     WebSocket,
     WebSocketDisconnect,
     WebSocketException,
@@ -484,8 +487,19 @@ async def battle_match_ws(
         # that window removed the interleaving entirely.
         asyncio.create_task(_mark_connected_safely(match_id=match_id, user_id=user_id, redis=redis))
 
+        recent_messages: deque[float] = deque()
         while True:
             raw_text = await websocket.receive_text()
+            now = time.monotonic()
+            while recent_messages and now - recent_messages[0] >= settings.BATTLE_WS_MESSAGE_RATE_LIMIT_WINDOW_SECONDS:
+                recent_messages.popleft()
+            if len(recent_messages) >= settings.BATTLE_WS_MESSAGE_RATE_LIMIT_MAX_CALLS:
+                # Dropped before parsing or touching the DB.
+                await websocket.send_json(
+                    ErrorEvent(detail="Too many messages — slow down.").model_dump(mode="json")
+                )
+                continue
+            recent_messages.append(now)
             try:
                 message = parse_inbound_message(json.loads(raw_text))
             except (json.JSONDecodeError, ValidationError) as exc:
@@ -494,7 +508,11 @@ async def battle_match_ws(
 
             async with AsyncSessionLocal() as db:
                 if isinstance(message, WSReadyMessage):
-                    await battle_gameplay_service.mark_ready(db, redis, match_id=match_id, user_id=user_id)
+                    try:
+                        await battle_gameplay_service.mark_ready(db, redis, match_id=match_id, user_id=user_id)
+                    except HTTPException as exc:
+                        # e.g. 404 for a match deleted meanwhile -- report it, don't drop the socket.
+                        await websocket.send_json(ErrorEvent(detail=str(exc.detail)).model_dump(mode="json"))
                 elif isinstance(message, WSAnswerMessage):
                     try:
                         result = await battle_gameplay_service.submit_battle_answer(
@@ -507,9 +525,13 @@ async def battle_match_ws(
                         detail = getattr(exc, "detail", str(exc))
                         await websocket.send_json(ErrorEvent(detail=str(detail)).model_dump(mode="json"))
                 elif isinstance(message, WSForfeitMessage):
-                    match = await battle_gameplay_service.forfeit_match(
-                        db, redis, match_id=match_id, forfeiting_user_id=user_id
-                    )
+                    try:
+                        match = await battle_gameplay_service.forfeit_match(
+                            db, redis, match_id=match_id, forfeiting_user_id=user_id
+                        )
+                    except HTTPException as exc:
+                        await websocket.send_json(ErrorEvent(detail=str(exc.detail)).model_dump(mode="json"))
+                        continue
                     if match.status == "completed":
                         event = await battle_ws_events.match_finished_event(db, match)
                         await ws_manager.publish(redis, match_id=match_id, event=event)
