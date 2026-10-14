@@ -49,7 +49,7 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.battle_match import BattleAnswer
 from app.models.question import Question
-from app.services.groq_service import generate_questions
+from app.services.groq_service import generate_questions, references_missing_visual
 from app.services.text_similarity import is_near_duplicate
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,9 @@ async def _fetch_battle_pool_questions(
     for candidate in candidates:
         if len(accepted) >= limit:
             break
+        # Rows generated before the text-only rule may point at a graph/table that can't be shown.
+        if references_missing_visual(candidate.question):
+            continue
         if is_near_duplicate(candidate.question, dedup_pool):
             continue
         accepted.append(candidate)

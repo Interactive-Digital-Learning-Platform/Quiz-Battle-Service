@@ -71,6 +71,48 @@ _MAX_OPTION_LENGTH = 512
 _MAX_LESSON_LENGTH = 255
 
 
+_VISUAL_NOUNS = (
+    r"(?:graphs?|charts?|diagrams?|figures?|images?|pictures?|photos?|photographs?|illustrations?"
+    r"|tables?|maps?|plots?|histograms?|grids?|drawings?|sketch(?:es)?|screenshots?)"
+)
+# A pointer at one specific visual the player would need to see. Naming a graph/map/figure in a self-contained word
+# problem ("The graph of y = log2(x - 3)...", "The map scale is 1 cm : 5 m", "the combined figure") doesn't match --
+# only deictic or lookup wording does:
+_VISUAL_REFERENCE = re.compile(
+    # "the following table", "the given pie chart", "this picture", "the accompanying diagram"
+    rf"\b(?:following|given|above|below|accompanying|attached|provided|this|these)\s+(?:[\w-]+\s+)?{_VISUAL_NOUNS}\b"
+    # "in the diagram", "based on the bar graph", "according to the table" (not "...of the graph of y = ...")
+    rf"|\b(?:in|from|using|according\s+to|based\s+on|refer(?:ring)?\s+to|look\s+at|study|observe|examine)"
+    rf"\s+the\s+(?:[\w-]+\s+)?{_VISUAL_NOUNS}\b(?!\s+of\b)"
+    # "the table below", "the diagram shows", "the graph shown"
+    rf"|\b(?:the|this)\s+(?:[\w-]+\s+)?{_VISUAL_NOUNS}\s+(?:below|above|here|shown|shows|illustrates|depicts)\b"
+    # "shown above", "illustrated below"
+    r"|\b(?:shown|displayed|illustrated|depicted|pictured)\s+(?:above|below|here|alongside)\b"
+    # "Figure 2", "Table 1", "Diagram 3"
+    r"|\b(?:figure|fig\.|diagram|table|graph|image|picture)\s+\d+\b"
+    # A data chart described as the source: "A bar graph shows the books read: 10, 15, 12, 8. Which class read the
+    # most?" -- the labels the options rely on live only in the missing chart. (Maps, scale drawings and figures
+    # in word problems carry their data in the text, so they aren't included here.)
+    r"|\b(?:a|an|the)\s+(?:[\w-]+\s+)?(?:bar\s+graph|bar\s+chart|pie\s+chart|line\s+graph|histogram|pictograph"
+    r"|pictogram|tally\s+chart|graph|chart|table)s?\s+(?:shows|showing|displays|represents|gives|lists|records)\b",
+    re.IGNORECASE,
+)
+# "the periodic table", "the water table", "the 7 times table", "the truth table for an AND gate" -- things a
+# question can name without anything being drawn.
+_TEXT_ONLY_COMPOUNDS = re.compile(
+    r"\b(?:periodic|water|times|multiplication|truth|food|round|dining|kitchen)\s+tables?\b"
+    r"|\b(?:road|world|mind|concept|treasure)\s+maps?\b",
+    re.IGNORECASE,
+)
+
+
+def references_missing_visual(text: str) -> bool:
+    """True if the question points at a graph/diagram/table/image/map that
+    doesn't exist -- battles are text-only, so such a question can't be
+    answered. Used on generated questions and on pool reads."""
+    return any(not _TEXT_ONLY_COMPOUNDS.search(m.group(0)) for m in _VISUAL_REFERENCE.finditer(text))
+
+
 def _checked_correct_answer(
     question_text: str, options: object, correct: str, *, index: int, kind: str,
 ) -> str | None:
@@ -85,8 +127,13 @@ def _checked_correct_answer(
     - no two options the same ignoring case/whitespace -- battle grading is
       case-insensitive, so duplicates would make two picks "correct";
     - correct_answer matches an option (exact, else case/whitespace-insensitive) --
-      never default to options[0] and mislabel a wrong answer as correct.
+      never default to options[0] and mislabel a wrong answer as correct;
+    - answerable from the text alone -- no reference to a graph, diagram,
+      table, image or map that isn't there (see references_missing_visual).
     """
+    if question_text and references_missing_visual(question_text):
+        logger.warning("Skipping %s at index %d: refers to a visual that isn't shown: %r", kind, index, question_text)
+        return None
     if (
         not question_text
         or not isinstance(options, list)
@@ -197,6 +244,10 @@ VARIETY REQUIREMENTS — mix ALL of the following styles across the set:
 - Numerical / formula-based (for maths/science topics where appropriate).
 
 QUALITY RULES:
+- TEXT ONLY: every question must be fully answerable from its own text. Never refer to a graph,
+  chart, diagram, figure, table, image, picture or map ("the bar graph below", "the diagram shows",
+  "Figure 1") — none can be shown. Never present data as coming from one either ("A bar graph shows...");
+  state it directly in words with every label the options use (e.g. "Class A read 10 books, Class B 15...").
 - Each question must have EXACTLY 4 options.
 - correct_answer must be EXACTLY one of the 4 options (copy it verbatim).
 - All 4 options must be plausible — avoid obviously wrong distractors.
@@ -413,6 +464,10 @@ VARIETY REQUIREMENTS — mix ALL of the following styles across the set:
   negation (sparingly), and numerical/formula-based (for maths/science where appropriate).
 
 QUALITY RULES:
+- TEXT ONLY: every question must be fully answerable from its own text. Never refer to a graph,
+  chart, diagram, figure, table, image, picture or map ("the bar graph below", "the diagram shows",
+  "Figure 1") — none can be shown. Never present data as coming from one either ("A bar graph shows...");
+  state it directly in words with every label the options use (e.g. "Class A read 10 books, Class B 15...").
 - Each question must have EXACTLY 4 options.
 - correct_answer must be EXACTLY one of the 4 options (copy it verbatim).
 - All 4 options must be plausible — avoid obviously wrong distractors.
