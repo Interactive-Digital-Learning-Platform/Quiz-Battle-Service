@@ -470,7 +470,7 @@ async def test_reconcile_leaves_queued_and_matching_state_untouched(db_session, 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# clear_all_queue_state -- the startup reset (app/main.py's on_startup calls
+# clear_all_queue_state -- the startup reset (app/main.py's lifespan calls
 # this before the sweep loop starts) that clears leftover "queued" Redis
 # entries a server restart would otherwise leave sitting there indefinitely.
 # ─────────────────────────────────────────────────────────────────────────────

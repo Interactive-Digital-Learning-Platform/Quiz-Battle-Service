@@ -7,7 +7,7 @@ Matches are inserted directly as finished rows rather than played through
 battle_gameplay_service -- these tests are about the aggregation, not the
 match lifecycle.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import settings
 from app.models.battle_match import BattleAnswer, BattleMatch, BattleParticipant
@@ -16,7 +16,7 @@ from app.services import battle_analytics_service
 from app.services.user_service import get_or_create_user
 from tests.conftest import TEST_CLERK_ID
 
-T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 _OPPOSITE = {"win": "loss", "loss": "win", "draw": "draw", "forfeit": "win"}
 
 

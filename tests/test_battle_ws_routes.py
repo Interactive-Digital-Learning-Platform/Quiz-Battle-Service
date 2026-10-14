@@ -627,12 +627,11 @@ def test_socket_closed_mid_handshake_by_terminal_sweep_does_not_crash(ws_env):
     with patch(
         "app.api.routes.battle_ws.battle_gameplay_service.get_match_state",
         new=_get_match_state_then_close,
-    ):
-        with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws:
-            connected = ws.receive_json()
-            assert connected["type"] == "connected"
-            with pytest.raises(WebSocketDisconnect):
-                ws.receive_json()  # state_sync never arrives -- socket already closed
+    ), ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws:
+        connected = ws.receive_json()
+        assert connected["type"] == "connected"
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()  # state_sync never arrives -- socket already closed
 
     # disconnect() must still have run despite the RuntimeError -- if the
     # handshake's exception had propagated past the route's try/finally

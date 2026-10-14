@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.core.config import settings
 
 
 class LeaderboardEntry(BaseModel):
@@ -59,7 +61,19 @@ class CompetitiveProfileResponse(BaseModel):
 
 
 class JoinQueueRequest(BaseModel):
-    subject: str = Field(..., min_length=1)
+    # 100 = the subject column's length (battle_matches / competitive_subject_ratings).
+    subject: str = Field(..., min_length=1, max_length=100)
+
+    @field_validator("subject")
+    @classmethod
+    def _allowed_subject(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("subject must not be blank")
+        allowed = settings.battle_allowed_subjects
+        if allowed and value not in allowed:
+            raise ValueError(f"Unknown battle subject. Choose one of: {', '.join(sorted(allowed))}")
+        return value
 
 
 class OpponentPublicInfo(BaseModel):
@@ -217,7 +231,9 @@ class BattleHistoryResponse(BaseModel):
 
 class SubmitBattleAnswerRequest(BaseModel):
     question_id: int
-    selected_option: str = Field(..., min_length=1)
+    # 512 = battle_answers.selected_option's length. Longer picks used to be accepted into Redis and only fail at
+    # grading time, breaking the reveal for both players.
+    selected_option: str = Field(..., min_length=1, max_length=512)
 
 
 class SubmitBattleAnswerResponse(BaseModel):

@@ -49,7 +49,7 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.battle_match import BattleAnswer
 from app.models.question import Question
-from app.services.groq_service import generate_questions
+from app.services.groq_service import generate_questions, references_missing_visual
 from app.services.text_similarity import is_near_duplicate
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,9 @@ async def _fetch_battle_pool_questions(
     for candidate in candidates:
         if len(accepted) >= limit:
             break
+        # Rows generated before the text-only rule may point at a graph/table that can't be shown.
+        if references_missing_visual(candidate.question):
+            continue
         if is_near_duplicate(candidate.question, dedup_pool):
             continue
         accepted.append(candidate)
@@ -123,18 +126,25 @@ async def _fetch_battle_pool_questions(
     return accepted
 
 
-def _kickoff_pool_replenish(subject: str, difficulty: str) -> None:
+def _kickoff_pool_replenish(subject: str, difficulty: str, *, grow: bool = False) -> None:
     # A thin, easily-mockable wrapper around asyncio.create_task -- tests
     # patch this directly so they never spawn a real background Groq call
     # against a DB session/event loop the test has already torn down.
+    allowed = settings.battle_allowed_subjects
+    if allowed and subject not in allowed:
+        # Second line behind JoinQueueRequest's check (e.g. a match row from
+        # before the allow-list existed): never ask Groq to write questions
+        # into the shared pool for a subject outside the curriculum.
+        logger.warning("Not replenishing battle pool for unlisted subject=%r", subject)
+        return
     key = (subject, difficulty)
     if key in _replenishing_buckets:
         return
     _replenishing_buckets.add(key)
-    asyncio.create_task(_replenish_pool_task(subject, difficulty))
+    asyncio.create_task(_replenish_pool_task(subject, difficulty, grow=grow))
 
 
-async def _replenish_pool_task(subject: str, difficulty: str) -> None:
+async def _replenish_pool_task(subject: str, difficulty: str, *, grow: bool = False) -> None:
     """Runs after the triggering match activation has already returned its
     questions -- opens its own DB session (AsyncSessionLocal) since the
     request-scoped session is closed by then. Never lets a failure here
@@ -153,7 +163,11 @@ async def _replenish_pool_task(subject: str, difficulty: str) -> None:
                 .where(Question.subject == subject, Question.difficulty == difficulty)
             )
             current = (await session.execute(count_stmt)).scalar() or 0
-            needed = settings.BATTLE_POOL_TARGET_SIZE - current
+            # Normal top-up refills to the target size; a "grow" top-up (players
+            # have run out of never-seen questions) adds one more batch past it,
+            # up to the hard cap.
+            ceiling = settings.BATTLE_POOL_MAX_SIZE if grow else settings.BATTLE_POOL_TARGET_SIZE
+            needed = ceiling - current
             if needed <= 0:
                 return
 
@@ -245,6 +259,10 @@ async def _select_for_one_tier(
                 "short).",
                 subject, difficulty, len(repeat_questions),
             )
+        # These players have outgrown the pool -- add fresh questions in the
+        # background (past the normal target, up to BATTLE_POOL_MAX_SIZE) so
+        # their next matches aren't repeats they've already memorised.
+        _kickoff_pool_replenish(subject, difficulty, grow=True)
         questions.extend(repeat_questions)
         session_ids.update(q.id for q in repeat_questions)
         repeat_count = len(repeat_questions)

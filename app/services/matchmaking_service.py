@@ -346,8 +346,6 @@ def _join_queue_rate_limit_key(user_id: int) -> str:
 
 
 async def join_queue(db: AsyncSession, redis: Redis, *, user_id: int, subject: str) -> dict:
-    rating_row = await battle_service.get_or_create_subject_rating(db, user_id=user_id, subject=subject)
-
     # Everything below this point is Redis-dependent (rate limiting, the
     # Lua enqueue+claim atomicity, the status re-read) -- this is the most
     # user-facing, most-hit Redis path in the service, so an outage here
@@ -364,6 +362,9 @@ async def join_queue(db: AsyncSession, redis: Redis, *, user_id: int, subject: s
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many queue join attempts. Please wait a moment and try again.",
             )
+
+        # After the rate limit, so a client hammering join can't turn each attempt into a DB write.
+        rating_row = await battle_service.get_or_create_subject_rating(db, user_id=user_id, subject=subject)
 
         enqueued = await _lua_enqueue(
             redis, user_id=user_id, subject=subject, rating=rating_row.rating, queued_at=time.time()
@@ -389,13 +390,21 @@ async def join_queue(db: AsyncSession, redis: Redis, *, user_id: int, subject: s
 
 
 async def cancel_queue(db: AsyncSession, redis: Redis, *, user_id: int) -> dict:
-    subject = await _lua_cancel(redis, user_id=user_id)
-    if subject is not None:
-        await redis.zrem(_subject_queue_key(subject), str(user_id))
-        logger.info("Queue left — user_id=%s, subject=%s", user_id, subject)
-        return {"status": "idle"}
+    try:
+        subject = await _lua_cancel(redis, user_id=user_id)
+        if subject is not None:
+            await redis.zrem(_subject_queue_key(subject), str(user_id))
+            logger.info("Queue left — user_id=%s, subject=%s", user_id, subject)
+            return {"status": "idle"}
 
-    current_state = await redis.hget(_user_state_key(user_id), "state")
+        current_state = await redis.hget(_user_state_key(user_id), "state")
+    except RedisError:
+        # Same distinct signal as join_queue rather than an undifferentiated 500.
+        logger.exception("Redis error while cancelling matchmaking — user_id=%s", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Matchmaking is temporarily unavailable. Please try again shortly.",
+        )
     if current_state is None:
         return {"status": "idle"}  # already idle -- idempotent no-op, not an error
     raise HTTPException(

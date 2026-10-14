@@ -1,3 +1,6 @@
+import asyncio
+from typing import Annotated
+
 import jwt
 from fastapi import Depends, HTTPException, WebSocket, WebSocketException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -19,7 +22,9 @@ async def _verify_token(token: str) -> dict:
     # translate them into whatever their transport needs (get_current_user_ws
     # turns them into a WebSocketException).
     try:
-        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        # PyJWKClient fetches the JWKS with blocking urllib on a cache miss / key rotation; off the event loop
+        # so one slow Clerk round-trip doesn't stall every live battle socket on this process.
+        signing_key = await asyncio.to_thread(_jwks_client.get_signing_key_from_jwt, token)
 
         payload: dict = jwt.decode(
             token,
@@ -49,6 +54,17 @@ async def _verify_token(token: str) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid token: {exc}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Clerk session tokens carry `azp` (the origin that requested them). When CLERK_AUTHORIZED_PARTIES is set,
+    # only tokens minted for those origins are accepted; native-app tokens may have no azp, which is allowed.
+    allowed = {p.strip() for p in settings.CLERK_AUTHORIZED_PARTIES.split(",") if p.strip()}
+    azp = payload.get("azp")
+    if allowed and azp and azp not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token: unexpected authorized party.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -86,6 +102,20 @@ async def get_current_user(
     return await _verify_token(credentials.credentials)
 
 
+async def get_clerk_id(current_user: dict = Depends(get_current_user)) -> str:
+    # The Clerk user ID (`sub`) every user-scoped route keys on.
+    clerk_id: str = current_user.get("sub", "")
+    if not clerk_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is missing the 'sub' (user ID) claim.",
+        )
+    return clerk_id
+
+
+ClerkId = Annotated[str, Depends(get_clerk_id)]
+
+
 async def get_current_user_ws(websocket: WebSocket) -> dict:
     # WebSocket counterpart of get_current_user. Native WS clients generally
     # can't set a custom Authorization header on the handshake, so the token
@@ -97,10 +127,16 @@ async def get_current_user_ws(websocket: WebSocket) -> dict:
     if settings.ENVIRONMENT == "development" and settings.AUTH_BYPASS:
         return _dev_bypass_identity()
 
-    token = websocket.query_params.get("token")
+    # Preferred: `Authorization: Bearer <jwt>` on the handshake (the mobile app sets it via React Native's
+    # WebSocket headers option) -- headers stay out of access logs. `?token=` is only a fallback for clients that
+    # can't set handshake headers (browsers, older app builds); app.core.log_redaction scrubs it from our logs.
+    scheme, _, header_token = websocket.headers.get("authorization", "").partition(" ")
+    token = header_token.strip() if scheme.lower() == "bearer" else ""
+    token = token or websocket.query_params.get("token")
     if not token:
         raise WebSocketException(
-            code=status.WS_1008_POLICY_VIOLATION, reason="Missing 'token' query parameter."
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="Missing token: send 'Authorization: Bearer <token>' (or the 'token' query parameter).",
         )
 
     try:

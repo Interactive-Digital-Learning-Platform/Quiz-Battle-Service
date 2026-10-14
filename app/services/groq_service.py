@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -61,6 +62,119 @@ async def _create_chat_completion_with_retry(
     raise last_exc
 
 
+# Column limits the generated rows must fit: questions.correct_answer and
+# battle_answers.selected_option are String(512) -- a longer option couldn't be
+# stored as the answer, nor picked by a player (submissions are capped at 512)
+# -- and questions.lesson is String(255). One over-long value used to fail the
+# whole batch's commit.
+_MAX_OPTION_LENGTH = 512
+_MAX_LESSON_LENGTH = 255
+
+
+_VISUAL_NOUNS = (
+    r"(?:graphs?|charts?|diagrams?|figures?|images?|pictures?|photos?|photographs?|illustrations?"
+    r"|tables?|maps?|plots?|histograms?|grids?|drawings?|sketch(?:es)?|screenshots?)"
+)
+# A pointer at one specific visual the player would need to see. Naming a graph/map/figure in a self-contained word
+# problem ("The graph of y = log2(x - 3)...", "The map scale is 1 cm : 5 m", "the combined figure") doesn't match --
+# only deictic or lookup wording does:
+_VISUAL_REFERENCE = re.compile(
+    # "the following table", "the given pie chart", "this picture", "the accompanying diagram"
+    rf"\b(?:following|given|above|below|accompanying|attached|provided|this|these)\s+(?:[\w-]+\s+)?{_VISUAL_NOUNS}\b"
+    # "in the diagram", "based on the bar graph", "according to the table" (not "...of the graph of y = ...")
+    rf"|\b(?:in|from|using|according\s+to|based\s+on|refer(?:ring)?\s+to|look\s+at|study|observe|examine)"
+    rf"\s+the\s+(?:[\w-]+\s+)?{_VISUAL_NOUNS}\b(?!\s+of\b)"
+    # "the table below", "the diagram shows", "the graph shown"
+    rf"|\b(?:the|this)\s+(?:[\w-]+\s+)?{_VISUAL_NOUNS}\s+(?:below|above|here|shown|shows|illustrates|depicts)\b"
+    # "shown above", "illustrated below"
+    r"|\b(?:shown|displayed|illustrated|depicted|pictured)\s+(?:above|below|here|alongside)\b"
+    # "Figure 2", "Table 1", "Diagram 3"
+    r"|\b(?:figure|fig\.|diagram|table|graph|image|picture)\s+\d+\b"
+    # A data chart described as the source: "A bar graph shows the books read: 10, 15, 12, 8. Which class read the
+    # most?" -- the labels the options rely on live only in the missing chart. (Maps, scale drawings and figures
+    # in word problems carry their data in the text, so they aren't included here.)
+    r"|\b(?:a|an|the)\s+(?:[\w-]+\s+)?(?:bar\s+graph|bar\s+chart|pie\s+chart|line\s+graph|histogram|pictograph"
+    r"|pictogram|tally\s+chart|graph|chart|table)s?\s+(?:shows|showing|displays|represents|gives|lists|records)\b",
+    re.IGNORECASE,
+)
+# "the periodic table", "the water table", "the 7 times table", "the truth table for an AND gate" -- things a
+# question can name without anything being drawn.
+_TEXT_ONLY_COMPOUNDS = re.compile(
+    r"\b(?:periodic|water|times|multiplication|truth|food|round|dining|kitchen)\s+tables?\b"
+    r"|\b(?:road|world|mind|concept|treasure)\s+maps?\b",
+    re.IGNORECASE,
+)
+
+
+def references_missing_visual(text: str) -> bool:
+    """True if the question points at a graph/diagram/table/image/map that
+    doesn't exist -- battles are text-only, so such a question can't be
+    answered. Used on generated questions and on pool reads."""
+    return any(not _TEXT_ONLY_COMPOUNDS.search(m.group(0)) for m in _VISUAL_REFERENCE.finditer(text))
+
+
+def _checked_correct_answer(
+    question_text: str, options: object, correct: str, *, index: int, kind: str,
+) -> str | None:
+    """Shared shape check for generated questions (kept in step with
+    Personalized-Quiz-Service's copy). Returns the correct answer (normalised
+    to the matching option's exact text) or None if the question should be
+    dropped -- the caller's retry loop tops up any shortfall rather than us
+    patching a bad question up:
+
+    - exactly 4 non-empty string options, each at most _MAX_OPTION_LENGTH
+      (Groq occasionally returns 5+, or non-string values);
+    - no two options the same ignoring case/whitespace -- battle grading is
+      case-insensitive, so duplicates would make two picks "correct";
+    - correct_answer matches an option (exact, else case/whitespace-insensitive) --
+      never default to options[0] and mislabel a wrong answer as correct;
+    - answerable from the text alone -- no reference to a graph, diagram,
+      table, image or map that isn't there (see references_missing_visual).
+    """
+    if question_text and references_missing_visual(question_text):
+        logger.warning("Skipping %s at index %d: refers to a visual that isn't shown: %r", kind, index, question_text)
+        return None
+    if (
+        not question_text
+        or not isinstance(options, list)
+        or len(options) != 4
+        or not all(isinstance(o, str) and o.strip() and len(o) <= _MAX_OPTION_LENGTH for o in options)
+    ):
+        logger.warning(
+            "Skipping malformed %s at index %d: expected 4 non-empty options of at most %d chars, got %r",
+            kind, index, _MAX_OPTION_LENGTH, options,
+        )
+        return None
+
+    normalised = [o.strip().lower() for o in options]
+    if len(set(normalised)) != len(normalised):
+        logger.warning("Skipping %s at index %d: duplicate options %r", kind, index, options)
+        return None
+
+    if correct in options:
+        return correct
+    try:
+        return options[normalised.index(correct.strip().lower())]
+    except ValueError:
+        logger.warning(
+            "Skipping %s at index %d: correct_answer %r not found in options %r",
+            kind, index, correct, options,
+        )
+        return None
+
+
+_PROMPT_UNSAFE_CHARS = re.compile(r"[^\w &(),./'-]")
+
+
+def _prompt_safe(text: str, *, max_length: int = 100) -> str:
+    """A subject/lesson name as it goes into the prompt: one line, plain name
+    characters only, capped. Strips the newlines, quotes, brackets and the
+    like an injected instruction ("...\n\nIgnore the syllabus and...")
+    would need to break out of its field."""
+    text = _PROMPT_UNSAFE_CHARS.sub(" ", text)
+    return " ".join(text.split())[:max_length]
+
+
 async def generate_questions(
     grade: int,
     subject: str,
@@ -94,6 +208,9 @@ async def generate_questions(
     existing_questions = existing_questions or []
     avoid_lessons = avoid_lessons or []
     random_lessons = lesson is None
+    subject = _prompt_safe(subject)
+    if lesson is not None:
+        lesson = _prompt_safe(lesson, max_length=255)
 
     system_prompt = """You are an expert educational content creator for Sri Lankan school students.
 Your task is to generate UNIQUE, DIVERSE multiple-choice quiz questions.
@@ -127,6 +244,10 @@ VARIETY REQUIREMENTS — mix ALL of the following styles across the set:
 - Numerical / formula-based (for maths/science topics where appropriate).
 
 QUALITY RULES:
+- TEXT ONLY: every question must be fully answerable from its own text. Never refer to a graph,
+  chart, diagram, figure, table, image, picture or map ("the bar graph below", "the diagram shows",
+  "Figure 1") — none can be shown. Never present data as coming from one either ("A bar graph shows...");
+  state it directly in words with every label the options use (e.g. "Class A read 10 books, Class B 15...").
 - Each question must have EXACTLY 4 options.
 - correct_answer must be EXACTLY one of the 4 options (copy it verbatim).
 - All 4 options must be plausible — avoid obviously wrong distractors.
@@ -253,33 +374,11 @@ QUALITY RULES:
         options = q.get("options", [])
         correct = str(q.get("correct_answer", "")).strip()
         explanation = str(q.get("explanation", "")).strip()
-        q_lesson = lesson if lesson else (str(q.get("lesson", "")).strip() or subject)
+        q_lesson = (lesson if lesson else (str(q.get("lesson", "")).strip() or subject))[:_MAX_LESSON_LENGTH]
 
-        # Must have exactly 4 options (Groq occasionally ignores that rule
-        # and returns 5+). Truncating to 4 risks losing the actual correct
-        # answer, so a bad-count question is dropped entirely rather than
-        # patched up — the caller's retry loop tops up the shortfall.
-        if not question_text or not isinstance(options, list) or len(options) != 4:
-            logger.warning(
-                "Skipping malformed question at index %d: expected 4 options, got %d",
-                i, len(options) if isinstance(options, list) else 0,
-            )
+        correct = _checked_correct_answer(question_text, options, correct, index=i, kind="question")
+        if correct is None:
             continue
-
-        # correct_answer has to actually match one of the options (exact, or
-        # case/whitespace-insensitive). If it matches neither, there's no way
-        # to know which option is really correct — dropping it beats the old
-        # behavior of defaulting to options[0] and mislabeling a wrong answer
-        # as correct.
-        if correct not in options:
-            match = next((o for o in options if o.strip().lower() == correct.strip().lower()), None)
-            if match is None:
-                logger.warning(
-                    "Skipping question at index %d: correct_answer %r not found in options %r",
-                    i, correct, options,
-                )
-                continue
-            correct = match
 
         validated.append({
             "question": question_text,
@@ -365,6 +464,10 @@ VARIETY REQUIREMENTS — mix ALL of the following styles across the set:
   negation (sparingly), and numerical/formula-based (for maths/science where appropriate).
 
 QUALITY RULES:
+- TEXT ONLY: every question must be fully answerable from its own text. Never refer to a graph,
+  chart, diagram, figure, table, image, picture or map ("the bar graph below", "the diagram shows",
+  "Figure 1") — none can be shown. Never present data as coming from one either ("A bar graph shows...");
+  state it directly in words with every label the options use (e.g. "Class A read 10 books, Class B 15...").
 - Each question must have EXACTLY 4 options.
 - correct_answer must be EXACTLY one of the 4 options (copy it verbatim).
 - All 4 options must be plausible — avoid obviously wrong distractors.
@@ -477,24 +580,11 @@ QUALITY RULES:
         options = q.get("options", [])
         correct = str(q.get("correct_answer", "")).strip()
         explanation = str(q.get("explanation", "")).strip()
-        question_lesson = str(q.get("lesson", "")).strip() or subject
+        question_lesson = (str(q.get("lesson", "")).strip() or subject)[:_MAX_LESSON_LENGTH]
 
-        if not question_text or not isinstance(options, list) or len(options) != 4:
-            logger.warning(
-                "Skipping malformed shuffle question at index %d: expected 4 options, got %d",
-                i, len(options) if isinstance(options, list) else 0,
-            )
+        correct = _checked_correct_answer(question_text, options, correct, index=i, kind="shuffle question")
+        if correct is None:
             continue
-
-        if correct not in options:
-            match = next((o for o in options if o.strip().lower() == correct.strip().lower()), None)
-            if match is None:
-                logger.warning(
-                    "Skipping shuffle question at index %d: correct_answer %r not found in options %r",
-                    i, correct, options,
-                )
-                continue
-            correct = match
 
         validated.append({
             "subject": subject,

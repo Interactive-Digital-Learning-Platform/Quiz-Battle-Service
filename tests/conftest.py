@@ -32,7 +32,11 @@ from app.core.database import Base, get_db
 from app.core.redis_client import get_redis
 from app.core.security import get_current_user
 from app.main import app
-from app.services import battle_gameplay_service, battle_question_service, matchmaking_service
+from app.services import (
+    battle_gameplay_service,
+    battle_question_service,
+    matchmaking_service,
+)
 
 TEST_CLERK_ID = "test-user"
 
@@ -52,7 +56,7 @@ def _no_real_pool_replenish(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_real_matchmaking_sweep_loop(monkeypatch):
     # start_matchmaking_sweep_loop() is only ever started for real in
-    # app/main.py's on_startup, which httpx.ASGITransport (used by the
+    # app/main.py's lifespan, which httpx.ASGITransport (used by the
     # `client` fixture below) never triggers -- it only ever sends "http"
     # scope calls, never "lifespan" (confirmed by reading its source). This
     # is a defensive neutralization in case that ever changes.
