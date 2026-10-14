@@ -1218,6 +1218,18 @@ async def submit_battle_answer(
     current_order = _current_question_order(match)
     current_question = await question_payload_for(db, match, current_order)
     if current_question is None or current_question["question_id"] != question_id:
+        # An earlier question of this same match is just a late answer (e.g. held up by a flaky mobile connection
+        # until the next question had started) -- report it as locked, like any other late answer, rather than as
+        # a bad request. Anything else (a future slot, another match's question) stays a 400.
+        answered_order = (
+            await db.execute(
+                select(BattleMatchQuestion.question_order).where(
+                    BattleMatchQuestion.match_id == match_id, BattleMatchQuestion.question_id == question_id
+                )
+            )
+        ).scalar_one_or_none()
+        if answered_order is not None and answered_order < current_order:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Answers are locked for this question.")
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This is not the current question.")
     # The pick locks once the reveal phase starts, whether or not the grading
     # timer has run yet -- otherwise a lagging timer would let a late answer in.

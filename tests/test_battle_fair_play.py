@@ -8,9 +8,12 @@ tests/test_battle_fair_play.py
   is cancelled.
 - Memorisation: option order is shuffled per match (same for both players),
   and running out of never-seen questions grows the pool.
+- A late answer to an earlier question is "locked", not a bad request.
 """
 from datetime import UTC, datetime, timedelta
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy import select, update
 
 from app.core.config import settings
@@ -171,3 +174,31 @@ async def test_running_out_of_unseen_questions_grows_the_pool(db_session, monkey
 
     assert repeats == 3  # all already seen -- served as a last resort
     assert ("Mathematics", "medium", True) in calls
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Late answers to an earlier question
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_late_answer_to_previous_question_is_locked_not_a_bad_request(db_session, fake_redis):
+    a = await _make_user(db_session, "user-a")
+    b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(
+        db_session, subject="Mathematics", difficulty="Mostly Medium",
+        user_a_id=a.id, rating_a=1000, user_b_id=b.id, rating_b=1000,
+    )
+    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=a.id, user_b_id=b.id)
+    # Question 1 is now on; an answer for question 0 (held up in transit) arrives.
+    await _set_started_at(
+        db_session, match.id, datetime.now(UTC) - timedelta(seconds=settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS + 1)
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await battle_gameplay_service.submit_battle_answer(
+            db_session, match_id=match.id, user_id=a.id, question_id=questions[0].id,
+            selected_option="A", redis=fake_redis,
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Answers are locked for this question."
