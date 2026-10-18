@@ -57,12 +57,12 @@ class QuestionScoreResult:
 
 
 def compute_question_score(
-    *, is_correct: bool, response_time_seconds: float, streak_after_this_answer: int,
+    *, is_correct: bool, response_time_seconds: float, streak_after_this_answer: int = 0,
 ) -> QuestionScoreResult:
-    """Wrong answer -> everything 0 (no negative points). Caller is
-    responsible for passing the correct streak_after_this_answer (see
-    battle_gameplay_service for how it's derived from prior BattleAnswer
-    rows).
+    """Correct -> base + speed bonus + streak bonus; wrong or skipped ->
+    everything 0 (no negative points). streak_after_this_answer counts this
+    answer too (see battle_gameplay_service for how it's derived from the
+    player's earlier answers).
     """
     if not is_correct:
         return QuestionScoreResult(False, 0, 0, 0, 0)
@@ -88,20 +88,18 @@ class WinnerResult:
 
 
 def determine_winner(a: ParticipantOutcome, b: ParticipantOutcome) -> WinnerResult:
-    """Exact 4-level priority from the product spec:
-    1. most correct answers wins
-    2. tie -> highest total battle score (base+speed+streak, summed over
-       all answers -- wrong answers already contribute 0) wins
+    """4-level priority:
+    1. highest total battle score (base + speed + streak bonus, summed over all
+       answers -- wrong/skipped answers contribute 0) wins
+    2. tie -> most correct answers wins
     3. tie -> lowest total response time (summed over correct answers only)
        wins
     4. tie -> draw
-    Worked example this satisfies: 9/10 correct + 1040 pts beats 8/10
-    correct + 1090 pts -- correctness strictly dominates bonus-inflated score.
     """
-    if a.correct_count != b.correct_count:
-        winner = a if a.correct_count > b.correct_count else b
-    elif a.total_score != b.total_score:
+    if a.total_score != b.total_score:
         winner = a if a.total_score > b.total_score else b
+    elif a.correct_count != b.correct_count:
+        winner = a if a.correct_count > b.correct_count else b
     elif a.total_response_time_ms != b.total_response_time_ms:
         winner = a if a.total_response_time_ms < b.total_response_time_ms else b
     else:

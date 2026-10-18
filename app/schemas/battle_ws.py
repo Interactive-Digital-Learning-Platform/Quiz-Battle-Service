@@ -7,8 +7,6 @@ from app.schemas.battle import (
     BattleMatchStateResponse,
     BattleParticipantResult,
     BattleQuestionPublic,
-    ParticipantQuestionResult,
-    SubmitBattleAnswerResponse,
 )
 
 
@@ -17,9 +15,22 @@ class WSReadyMessage(BaseModel):
 
 
 class WSAnswerMessage(BaseModel):
+    # "Next": the player's final pick for their current question.
     type: Literal["answer"] = "answer"
     question_id: int
     selected_option: str = Field(..., min_length=1, max_length=512)  # see SubmitBattleAnswerRequest
+
+
+class WSSkipMessage(BaseModel):
+    type: Literal["skip"] = "skip"
+    question_id: int
+
+
+class WSPongMessage(BaseModel):
+    # Reply to a server PingEvent -- the round trip feeds the speed bonus's
+    # network allowance (see BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS).
+    type: Literal["pong"] = "pong"
+    nonce: int
 
 
 class WSForfeitMessage(BaseModel):
@@ -27,7 +38,8 @@ class WSForfeitMessage(BaseModel):
 
 
 InboundMessage = Annotated[
-    WSReadyMessage | WSAnswerMessage | WSForfeitMessage, Field(discriminator="type")
+    WSReadyMessage | WSAnswerMessage | WSSkipMessage | WSPongMessage | WSForfeitMessage,
+    Field(discriminator="type"),
 ]
 
 _inbound_adapter: TypeAdapter[InboundMessage] = TypeAdapter(InboundMessage)
@@ -82,50 +94,39 @@ class MatchStartedEvent(BaseModel):
     subject: str
     difficulty: str
     question_count: int
+    ends_at: datetime
+    server_time: datetime
 
 
-class QuestionStartedEvent(BaseModel):
-    # Pushed once per question boundary (including the very first, right
-    # after MatchStartedEvent) -- lockstep play, both players receive the
-    # SAME question_index/question at the SAME wall-clock instant, derived
-    # from battle_gameplay_service._current_question_order.
-    type: Literal["question_started"] = "question_started"
+class NextQuestionEvent(BaseModel):
+    # Sent ONLY to the player it's for (self-paced play): question 0 to every
+    # socket when the match starts, then each player's next question right
+    # after their answer/skip is saved -- never before. A duplicate Next/Skip
+    # gets the same event again, unchanged. finished=True (question=None)
+    # once they've moved past the last question. Never says whether the
+    # answer was right.
+    type: Literal["next_question"] = "next_question"
     question_index: int
-    question: BattleQuestionPublic
-    time_remaining_seconds: float
+    question: BattleQuestionPublic | None
+    finished: bool
+    ends_at: datetime
+    server_time: datetime
 
 
-class AnswerAcknowledgedEvent(BaseModel):
-    # Grading is deferred to the reveal boundary now (see
-    # QuestionResultEvent below) -- this is just a lightweight "your
-    # (re)submission was accepted" ack, used by the client to clear its
-    # per-question in-flight submit guard. Never reveals correctness.
-    type: Literal["answer_acknowledged"] = "answer_acknowledged"
-    question_id: int
-    selected_option: str
-
-    @classmethod
-    def from_response(cls, response: SubmitBattleAnswerResponse) -> "AnswerAcknowledgedEvent":
-        return cls(**response.model_dump())
-
-
-class QuestionResultEvent(BaseModel):
-    # Pushed once per question, at the reveal boundary (last
-    # BATTLE_ANSWER_REVEAL_SECONDS of its window) -- see
-    # battle_gameplay_service._grade_and_reveal_question. Both players
-    # receive the SAME event (results for both participants), simultaneously,
-    # regardless of who answered first/last/at all -- replaces the old
-    # instant-per-submission answer_acknowledged (grading)/opponent_answered
-    # pair entirely.
-    type: Literal["question_result"] = "question_result"
+class PlayerProgressEvent(BaseModel):
+    # Broadcast after each saved answer/skip so the opponent's progress bar
+    # moves -- how far they are, never whether they were right.
+    type: Literal["player_progress"] = "player_progress"
+    user_id: int
     question_order: int
-    results: list[ParticipantQuestionResult]
-    # Safe to reveal now -- the question is already locked/graded by the
-    # time this event is built, unlike BattleQuestionPublic (which never
-    # carries it, per "Do Not Send Correct Answers Early"). Same value for
-    # both participants, so it lives here rather than duplicated per-entry
-    # in `results`.
-    correct_answer: str | None
+    answered: bool  # False = skipped
+    answered_count: int
+
+
+class PingEvent(BaseModel):
+    # The client answers with WSPongMessage(nonce) straight away.
+    type: Literal["ping"] = "ping"
+    nonce: int
 
 
 class PlayerDisconnectedEvent(BaseModel):
@@ -148,6 +149,9 @@ class MatchFinishedEvent(BaseModel):
     # Mobile (types/battleWsTypes.ts) already mirrors this real wire shape.
     type: Literal["match_finished"] = "match_finished"
     winner_user_id: int | None = None
+    # "forfeit" | "all_finished" | "time_up" -- see
+    # battle_gameplay_service.match_end_reason.
+    end_reason: str | None = None
     participants: list[BattleParticipantResult]
 
 

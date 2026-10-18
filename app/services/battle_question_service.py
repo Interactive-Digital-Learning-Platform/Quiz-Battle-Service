@@ -10,11 +10,16 @@ for this subject (via BattleAnswer -- see select_battle_questions), so this
 is no longer flat "any question in the subject" selection with zero novelty
 guarantee.
 
-Match activation NEVER calls Groq live -- it only ever reads the DB pool
-(see _select_for_one_tier), so a slow, rate-limited, or down Groq can no
-longer stall or fail a match start, and question selection is a fast,
-local-only DB read. Keeping each (subject, difficulty) pool stocked is
-instead a background concern: _fetch_battle_pool_questions triggers a
+AI first, pool second (BATTLE_AI_FIRST_ENABLED): a match start first asks
+the AI for fresh questions (_ai_first_questions) -- told what the two
+players have already seen, checked afterwards against everything they've
+been shown in a battle and against the pool, and saved into the pool -- and
+waits at most BATTLE_AI_GENERATION_TIMEOUT_SECONDS for them. Whatever the
+AI couldn't provide in time (slow, rate-limited, down, or its questions were
+repeats) is filled from the DB pool below, never-seen first, so a failing
+AI can delay a match start by that timeout but never cancel it. Keeping
+each (subject, difficulty) pool stocked as that fallback is a background
+concern: _fetch_battle_pool_questions triggers a
 debounced, fire-and-forget top-up (_kickoff_pool_replenish/
 _replenish_pool_task) whenever a bucket reads low, mirroring
 Personalized-Quiz-Service's quiz_service.py pool-replenish pattern (that's
@@ -36,10 +41,18 @@ battle_difficulty.py) rather than one flat difficulty for the whole match --
 never-seen-pool/repeat-as-last-resort pass PER TIER, sharing one running
 "session" accumulator (questions already picked this match, across every
 tier) across all of them so nothing repeats or near-duplicates across tiers.
+A tier its own difficulty can't fill (e.g. a subject with no medium
+questions yet) is topped up from the neighbouring difficulties rather than
+cancelling the match -- see select_battle_questions.
+
+warm_up_pools tops up every allowed subject's thin buckets once at startup,
+so a subject nobody has battled in yet isn't empty the first time it's played.
 """
 import asyncio
 import logging
+import math
 import random
+import time
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
@@ -47,9 +60,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models.battle_match import BattleAnswer
+from app.models.battle_match import (
+    BattleAnswer,
+    BattleMatch,
+    BattleMatchQuestion,
+    BattleParticipant,
+)
 from app.models.question import Question
+from app.services import telemetry_service
 from app.services.groq_service import generate_questions, references_missing_visual
+from app.services.question_fingerprint import compute_question_fingerprint
 from app.services.text_similarity import is_near_duplicate
 
 logger = logging.getLogger(__name__)
@@ -70,6 +90,14 @@ class BattleQuestionSelectionError(Exception):
 # Groq call, never a correctness problem, so no cross-process lock (same
 # reasoning as quiz_service's own _replenishing_buckets).
 _replenishing_buckets: set[tuple[str, str]] = set()
+
+# Where a short tier borrows from, nearest difficulty first.
+_NEIGHBOUR_DIFFICULTIES: dict[str, tuple[str, ...]] = {
+    "easy": ("medium", "hard"),
+    "medium": ("easy", "hard"),
+    "hard": ("medium", "easy"),
+}
+_POOL_DIFFICULTIES = ("easy", "medium", "hard")
 
 
 async def _fetch_battle_pool_questions(
@@ -203,6 +231,36 @@ async def _replenish_pool_task(subject: str, difficulty: str, *, grow: bool = Fa
         _replenishing_buckets.discard(key)
 
 
+async def warm_up_pools() -> None:
+    """One pass at startup: every allowed subject's (subject, difficulty)
+    bucket below BATTLE_POOL_MIN_SIZE gets one background top-up, one bucket
+    at a time (not all at once, to stay well inside Groq's rate limits).
+    Buckets already stocked cost nothing -- _replenish_pool_task returns
+    without calling Groq. Failures are logged and skipped, never fatal.
+    """
+    for subject in sorted(settings.battle_allowed_subjects):
+        for difficulty in _POOL_DIFFICULTIES:
+            key = (subject, difficulty)
+            if key in _replenishing_buckets:
+                continue
+            try:
+                async with AsyncSessionLocal() as session:
+                    size = (
+                        await session.execute(
+                            select(func.count()).select_from(Question)
+                            .where(Question.subject == subject, Question.difficulty == difficulty)
+                        )
+                    ).scalar() or 0
+            except Exception:
+                logger.exception("Pool warm-up couldn't read subject=%s difficulty=%s", subject, difficulty)
+                continue
+            if size >= settings.BATTLE_POOL_MIN_SIZE:
+                continue
+            logger.info("Warming up battle pool subject=%s difficulty=%s (has %d)", subject, difficulty, size)
+            _replenishing_buckets.add(key)
+            await _replenish_pool_task(subject, difficulty)  # releases the key itself
+
+
 async def _select_for_one_tier(
     db: AsyncSession, *, subject: str, difficulty: str, count: int,
     history_ids: set[int], history_texts: list[str],
@@ -270,29 +328,216 @@ async def _select_for_one_tier(
     return questions, repeat_count
 
 
+async def _seen_battle_questions(
+    db: AsyncSession, *, subject: str, participant_user_ids: tuple[int, int],
+) -> list[tuple[int, str, str]]:
+    """Every question either player has been SHOWN in a previous battle for
+    this subject -- (id, text, lesson), most recently seen first. "Shown"
+    means reached: everything up to and including the question a player was
+    on when their match ended (BattleMatchQuestion.question_order <= their
+    current_question_index), not just the ones they answered or skipped --
+    a question on screen when the clock ran out was still seen. Answered
+    questions are included directly too (BattleAnswer), which also covers
+    matches played before progress was tracked. Battles only: practice-mode
+    history is a separate service's and deliberately not considered.
+    """
+    reached = (
+        await db.execute(
+            select(Question.id, Question.question, Question.lesson, BattleMatch.started_at)
+            .join(BattleMatchQuestion, BattleMatchQuestion.question_id == Question.id)
+            .join(BattleMatch, BattleMatch.id == BattleMatchQuestion.match_id)
+            .join(BattleParticipant, BattleParticipant.match_id == BattleMatch.id)
+            .where(
+                Question.subject == subject,
+                BattleParticipant.user_id.in_(participant_user_ids),
+                BattleMatch.status.in_(("active", "completed")),
+                BattleMatchQuestion.question_order <= BattleParticipant.current_question_index,
+            )
+        )
+    ).all()
+    answered = (
+        await db.execute(
+            select(Question.id, Question.question, Question.lesson, BattleMatch.started_at)
+            .join(BattleAnswer, BattleAnswer.question_id == Question.id)
+            .join(BattleMatch, BattleMatch.id == BattleAnswer.match_id)
+            .where(BattleAnswer.user_id.in_(participant_user_ids), Question.subject == subject)
+        )
+    ).all()
+    latest: dict[int, tuple[str, str, float]] = {}
+    for qid, text, lesson, seen_at in [*reached, *answered]:
+        stamp = seen_at.timestamp() if seen_at is not None else 0.0
+        if qid not in latest or stamp > latest[qid][2]:
+            latest[qid] = (text, lesson, stamp)
+    ordered = sorted(latest.items(), key=lambda kv: -kv[1][2])
+    return [(qid, text, lesson) for qid, (text, lesson, _) in ordered]
+
+
 async def _seen_question_ids_and_texts(
     db: AsyncSession, *, subject: str, participant_user_ids: tuple[int, int],
 ) -> tuple[set[int], list[str]]:
-    """Every question either player has already answered in a PREVIOUS
-    battle for this subject, across ALL lessons -- the "never repeat" source
-    of truth. BattleAnswer already carries user_id directly (no join needed
-    to reach it, unlike single-player's QuestionAttempt->QuizSession chain).
-    Returns both IDs (for the notin_ pool filter) and texts (for the
-    near-duplicate check, so a pool question that's a rewording of a seen
-    question gets caught too, not just an exact-ID repeat).
+    """IDs (for the pool's notin_ filter) and texts (for the near-duplicate
+    check, so a reworded copy is caught too) of every question either player
+    has already been shown in a battle for this subject -- see
+    _seen_battle_questions."""
+    seen = await _seen_battle_questions(db, subject=subject, participant_user_ids=participant_user_ids)
+    return {qid for qid, _, _ in seen}, [text for _, text, _ in seen]
+
+
+# ── AI-first ────────────────────────────────────────────────────────────
+
+_ai_generation_slots: asyncio.Semaphore | None = None
+
+
+def _ai_slots() -> asyncio.Semaphore:
+    global _ai_generation_slots
+    if _ai_generation_slots is None:
+        _ai_generation_slots = asyncio.Semaphore(settings.BATTLE_AI_MAX_CONCURRENT_GENERATIONS)
+    return _ai_generation_slots
+
+
+async def _generate_ai_candidates(
+    *, subject: str, tier_counts: dict[str, int], avoid_texts: list[str], avoid_lessons: list[str],
+) -> tuple[dict[str, list[dict]], dict]:
+    """One AI request per difficulty tier, all at once, each asking for a
+    few more than the tier needs (BATTLE_AI_OVERGENERATE_RATIO). Whatever
+    has come back within BATTLE_AI_GENERATION_TIMEOUT_SECONDS is used; the
+    rest is cancelled. A failed or late tier just comes back empty -- the
+    pool covers it. Returns candidates per difficulty plus counters for
+    telemetry."""
+    wanted = {
+        difficulty: count + max(1, math.ceil(count * settings.BATTLE_AI_OVERGENERATE_RATIO))
+        for difficulty, count in tier_counts.items() if count > 0
+    }
+    stats = {"requested": sum(wanted.values()), "invalid": 0, "failed_tiers": 0, "timed_out_tiers": 0}
+    telemetry_by_tier = {difficulty: {} for difficulty in wanted}
+    tasks = {
+        difficulty: asyncio.create_task(generate_questions(
+            grade=settings.BATTLE_QUESTION_GRADE_DEFAULT, subject=subject, difficulty=difficulty,
+            question_count=n, existing_questions=avoid_texts, avoid_lessons=avoid_lessons,
+            telemetry=telemetry_by_tier[difficulty],
+        ))
+        for difficulty, n in wanted.items()
+    }
+    _done, pending = await asyncio.wait(tasks.values(), timeout=settings.BATTLE_AI_GENERATION_TIMEOUT_SECONDS)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    results: dict[str, list[dict]] = {}
+    for difficulty, task in tasks.items():
+        if task in pending:
+            stats["timed_out_tiers"] += 1
+            results[difficulty] = []
+            continue
+        exc = task.exception()
+        if exc is not None:
+            stats["failed_tiers"] += 1
+            logger.warning("AI battle questions failed subject=%s difficulty=%s: %s", subject, difficulty, exc)
+            results[difficulty] = []
+            continue
+        results[difficulty] = task.result()
+        stats["invalid"] += telemetry_by_tier[difficulty].get("invalid_question_count", 0)
+    return results, stats
+
+
+async def _ai_first_questions(
+    db: AsyncSession, *, subject: str, tier_counts: dict[str, int],
+    seen: list[tuple[int, str, str]],
+) -> dict[str, list[Question]]:
+    """Fresh AI questions for this match, per difficulty tier -- each one
+    checked to be neither a repeat nor a near-copy (exact fingerprint, or
+    the shared 55%-word-overlap rule) of anything either player has seen in
+    a battle, of anything already in this subject's pool, or of another
+    question in this batch. Every question that passes is saved to the pool
+    (in the caller's transaction); up to each tier's count is returned for
+    this match, any extras stay in the pool for later matches. Returns an
+    empty result -- never raises -- when the AI is busy (all generation
+    slots taken), slow, or failing: the pool then covers the whole match.
     """
-    rows = (
-        await db.execute(
-            select(Question.id, Question.question)
-            .join(BattleAnswer, BattleAnswer.question_id == Question.id)
-            .where(
-                BattleAnswer.user_id.in_(participant_user_ids),
-                Question.subject == subject,
-            )
-            .distinct()
+    slots = _ai_slots()
+    if slots.locked():
+        logger.info("AI battle questions skipped subject=%s — all generation slots busy; using the pool.", subject)
+        return {}
+
+    avoid_texts = [text for _, text, _ in seen[: settings.BATTLE_AI_AVOID_RECENT_QUESTIONS]]
+    lesson_counts: dict[str, int] = {}
+    for _, _, lesson in seen:
+        lesson_counts[lesson] = lesson_counts.get(lesson, 0) + 1
+    avoid_lessons = sorted(lesson_counts, key=lambda lesson: -lesson_counts[lesson])[: settings.BATTLE_AI_AVOID_TOP_LESSONS]
+
+    started = time.monotonic()
+    async with slots:
+        candidates, stats = await _generate_ai_candidates(
+            subject=subject, tier_counts=tier_counts, avoid_texts=avoid_texts, avoid_lessons=avoid_lessons,
         )
+
+    pool_rows = (
+        await db.execute(select(Question.question, Question.question_fingerprint).where(Question.subject == subject))
     ).all()
-    return {row[0] for row in rows}, [row[1] for row in rows]
+    blocked_texts = [text for _, text, _ in seen] + [row[0] for row in pool_rows]
+    blocked_fingerprints = {row[1] for row in pool_rows}
+
+    picked: dict[str, list[Question]] = {}
+    duplicates = saved = 0
+    for difficulty, batch in candidates.items():
+        accepted: list[Question] = []
+        for item in batch:
+            text = item["question"]
+            if references_missing_visual(text):
+                continue
+            fingerprint = compute_question_fingerprint(subject, item["lesson"], text)
+            if fingerprint in blocked_fingerprints or is_near_duplicate(text, blocked_texts):
+                duplicates += 1
+                continue
+            question = Question(
+                question=text, options=item["options"], correct_answer=item["correct_answer"],
+                subject=subject, lesson=item["lesson"], difficulty=difficulty,
+            )
+            db.add(question)
+            accepted.append(question)
+            blocked_fingerprints.add(fingerprint)
+            blocked_texts.append(text)
+        saved += len(accepted)
+        picked[difficulty] = accepted[: tier_counts.get(difficulty, 0)]
+    if saved:
+        await db.flush()  # ids for the match's BattleMatchQuestion rows
+
+    used = sum(len(q) for q in picked.values())
+    needed = sum(tier_counts.values())
+    latency_ms = (time.monotonic() - started) * 1000
+    logger.info(
+        "AI battle questions subject=%s: %d/%d for this match (%d new saved to the pool, %d repeats/near-copies "
+        "dropped, %d tier(s) failed, %d timed out) in %.0fms",
+        subject, used, needed, saved, duplicates, stats["failed_tiers"], stats["timed_out_tiers"], latency_ms,
+    )
+    _kickoff_ai_telemetry(
+        subject=subject, requested=stats["requested"], generated=saved,
+        success=used >= needed, used_pool=used < needed, duplicates=duplicates,
+        invalid=stats["invalid"], latency_ms=latency_ms,
+        error_category=None if used >= needed else ("provider_error" if stats["failed_tiers"] or stats["timed_out_tiers"] else "insufficient_pool"),
+    )
+    return picked
+
+
+def _kickoff_ai_telemetry(**fields) -> None:
+    # Written in the background on its own session: record_generation_event
+    # commits, and this runs inside the match-start transaction.
+    asyncio.create_task(_record_ai_telemetry(**fields))
+
+
+async def _record_ai_telemetry(
+    *, subject: str, requested: int, generated: int, success: bool, used_pool: bool,
+    duplicates: int, invalid: int, latency_ms: float, error_category: str | None,
+) -> None:
+    async with AsyncSessionLocal() as session:
+        await telemetry_service.record_generation_event(
+            session, user_id=None, subject=subject,
+            requested_question_count=requested, generated_question_count=generated,
+            provider="groq", model_name=settings.GROQ_MODEL, success=success,
+            used_cache_fallback=used_pool, retry_count=0, duplicate_count=duplicates,
+            invalid_question_count=invalid, latency_ms=latency_ms, error_category=error_category,
+        )
 
 
 async def select_battle_questions(
@@ -311,9 +556,10 @@ async def select_battle_questions(
     filled (the never-seen pool for a tier's difficulty is too thin), in
     which case _select_for_one_tier's second phase allows already-answered
     questions back in as a last resort rather than cancelling the match; see
-    its docstring. Raises BattleQuestionSelectionError only if even repeats
-    can't fill a tier -- caller cancels the whole match, never starts it
-    partially filled.
+    its docstring. A tier still short after that borrows from the
+    neighbouring difficulties. Raises BattleQuestionSelectionError only if
+    even that can't fill it -- caller cancels the whole match, never starts
+    it partially filled.
 
     Never calls Groq itself -- purely a DB read (fast, no external-API
     latency or rate-limit risk in the match-activation critical path). Pool
@@ -323,9 +569,9 @@ async def select_battle_questions(
     tier and source (never-seen vs. repeat) never correlate with its
     position in the match.
     """
-    history_ids, history_texts = await _seen_question_ids_and_texts(
-        db, subject=subject, participant_user_ids=participant_user_ids,
-    )
+    seen = await _seen_battle_questions(db, subject=subject, participant_user_ids=participant_user_ids)
+    history_ids = {qid for qid, _, _ in seen}
+    history_texts = [text for _, text, _ in seen]
     # Grows as tiers are processed -- see _select_for_one_tier's docstring.
     # Kept separate from history_ids/history_texts (static) so the last-
     # resort repeat phase can drop history from the exclusion while still
@@ -335,6 +581,19 @@ async def select_battle_questions(
 
     questions: list[Question] = []
     total_requested = sum(tier_counts.values())
+
+    # AI first: fresh questions neither player has seen; the pool (below)
+    # only fills what the AI couldn't provide in time.
+    if settings.BATTLE_AI_FIRST_ENABLED:
+        ai_picked = await _ai_first_questions(db, subject=subject, tier_counts=tier_counts, seen=seen)
+        for difficulty, picked in ai_picked.items():
+            questions.extend(picked)
+            session_ids.update(q.id for q in picked)
+            session_texts.extend(q.question for q in picked)
+        tier_counts = {
+            difficulty: count - len(ai_picked.get(difficulty, []))
+            for difficulty, count in tier_counts.items()
+        }
 
     agg_repeats = 0
     short_tiers: list[str] = []
@@ -349,7 +608,29 @@ async def select_battle_questions(
         )
         questions.extend(tier_questions)
         agg_repeats += repeat_count
-        if len(tier_questions) < count:
+
+        # Not enough at this difficulty (e.g. a subject with no medium
+        # questions yet): borrow from the nearest other difficulties instead
+        # of cancelling the match. The thin bucket itself is already being
+        # topped up in the background (_fetch_battle_pool_questions).
+        missing = count - len(tier_questions)
+        for neighbour in _NEIGHBOUR_DIFFICULTIES.get(difficulty, ()):
+            if missing <= 0:
+                break
+            borrowed, borrowed_repeats = await _select_for_one_tier(
+                db, subject=subject, difficulty=neighbour, count=missing,
+                history_ids=history_ids, history_texts=history_texts,
+                session_ids=session_ids, session_texts=session_texts,
+            )
+            if borrowed:
+                logger.warning(
+                    "Battle question selection borrowed %d %s question(s) for the %s tier subject=%s",
+                    len(borrowed), neighbour, difficulty, subject,
+                )
+            questions.extend(borrowed)
+            agg_repeats += borrowed_repeats
+            missing -= len(borrowed)
+        if missing > 0:
             short_tiers.append(difficulty)
 
     if agg_repeats:

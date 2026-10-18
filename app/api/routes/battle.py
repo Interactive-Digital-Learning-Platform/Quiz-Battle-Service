@@ -12,13 +12,15 @@ from app.schemas.battle import (
     BattleAnalyticsResponse,
     BattleHistoryResponse,
     BattleMatchStateResponse,
+    BattleNextQuestionResponse,
     CompetitiveProfileResponse,
     JoinQueueRequest,
     LeaderboardResponse,
     QueueStatusResponse,
+    SkipBattleQuestionRequest,
     SubmitBattleAnswerRequest,
-    SubmitBattleAnswerResponse,
 )
+from app.schemas.battle_ws import PlayerProgressEvent
 from app.services import (
     battle_analytics_service,
     battle_gameplay_service,
@@ -246,21 +248,38 @@ async def get_battle_match_state(
     return BattleMatchStateResponse(**data)
 
 
+async def _announce_answer_outcome(
+    db: AsyncSession, redis: Redis, *, match_id: int, outcome: battle_gameplay_service.AnswerOutcome,
+) -> BattleNextQuestionResponse:
+    # Same announcements as the WS answer/skip path (battle_ws.py's
+    # _send_answer_outcome) -- only the answering player's next question
+    # comes back as this response instead of over their socket.
+    if outcome.progress is not None:
+        await ws_manager.publish(
+            redis, match_id=match_id, event=PlayerProgressEvent(**outcome.progress).model_dump(mode="json"),
+        )
+        if outcome.match.status == "completed":
+            event = await battle_ws_events.match_finished_event(db, outcome.match)
+            await ws_manager.publish(redis, match_id=match_id, event=event)
+    return BattleNextQuestionResponse(**outcome.next)
+
+
 @router.post(
     "/match/{match_id}/answer",
-    response_model=SubmitBattleAnswerResponse,
+    response_model=BattleNextQuestionResponse,
     status_code=status.HTTP_200_OK,
-    summary="Submit a battle answer",
+    summary="Answer your current question (Next)",
     description=(
-        "Submits an answer to the CURRENT question only (lockstep play -- "
-        "both players are always on the same question at the same time, "
-        "derived from elapsed time since the match started). "
-        "Server-authoritative: correctness, response time (measured from "
-        "when this question's fixed window opened), and scoring "
-        "(base + speed bonus + streak bonus) are all computed server-side, "
-        "never trusted from the client. 400 if the question isn't the "
-        "current one; 409 if already answered (one answer per player per "
-        "question, DB-constraint enforced) or the match isn't active."
+        "Saves the caller's final pick for their CURRENT question (self-paced "
+        "play -- each player moves through the same questions at their own "
+        "pace) and returns their next question, only once the answer is "
+        "saved. Server-authoritative: correctness, response time (from when "
+        "the server handed out this question, minus a capped network "
+        "allowance) and scoring (base + speed bonus) are all computed "
+        "server-side and not revealed until the match ends. A repeat for an "
+        "already-saved question just returns the current question again. "
+        "400 if the question isn't the caller's current or an earlier one; "
+        "409 if the match isn't active."
     ),
 )
 async def submit_battle_match_answer(
@@ -269,14 +288,40 @@ async def submit_battle_match_answer(
     payload: SubmitBattleAnswerRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
-) -> SubmitBattleAnswerResponse:
+) -> BattleNextQuestionResponse:
     user = await get_or_create_user(db, clerk_id)
-    data = await battle_gameplay_service.submit_battle_answer(
+    outcome = await battle_gameplay_service.submit_battle_answer(
         db, match_id=match_id, user_id=user.id,
         question_id=payload.question_id, selected_option=payload.selected_option,
         redis=redis,
     )
-    return SubmitBattleAnswerResponse(**data)
+    return await _announce_answer_outcome(db, redis, match_id=match_id, outcome=outcome)
+
+
+@router.post(
+    "/match/{match_id}/skip",
+    response_model=BattleNextQuestionResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Skip your current question",
+    description=(
+        "Records the caller's CURRENT question as skipped (0 points) and "
+        "returns their next question, only once the skip is saved. Same "
+        "duplicate/400/409 behaviour as POST .../answer."
+    ),
+)
+async def skip_battle_match_question(
+    clerk_id: ClerkId,
+    match_id: int,
+    payload: SkipBattleQuestionRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+) -> BattleNextQuestionResponse:
+    user = await get_or_create_user(db, clerk_id)
+    outcome = await battle_gameplay_service.submit_battle_answer(
+        db, match_id=match_id, user_id=user.id, question_id=payload.question_id, selected_option=None,
+        redis=redis,
+    )
+    return await _announce_answer_outcome(db, redis, match_id=match_id, outcome=outcome)
 
 
 @router.post(

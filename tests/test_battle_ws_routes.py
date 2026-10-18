@@ -62,7 +62,6 @@ from app.services.user_service import get_or_create_user
 CLERK_A = "ws-battle-user-a"
 CLERK_B = "ws-battle-user-b"
 N = settings.BATTLE_QUESTION_COUNT
-Q = settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
 
 
 async def _override_get_current_user_ws(websocket: WebSocket) -> dict:
@@ -80,8 +79,8 @@ async def _override_get_current_user_ws(websocket: WebSocket) -> dict:
 def _events_by_type(ws, n: int) -> dict:
     """Receive exactly `n` messages and key them by `type` -- used wherever
     a socket may receive its OWN action's broadcast alongside a direct
-    response (e.g. answering both triggers a direct `answer_acknowledged`
-    AND a self-delivered `opponent_answered`, per battle_connection_manager's
+    response (e.g. Next both sends a direct `next_question` AND a
+    self-delivered `player_progress`, per battle_connection_manager's
     "publish reaches every locally-connected socket, including the
     publisher's own" design), so relying on receive order would be flaky.
     """
@@ -146,6 +145,12 @@ class WsEnv:
                 )
                 await db.commit()
         self.run(_backdate())
+
+    def match_status(self) -> str:
+        async def _status():
+            async with self.session_factory() as db:
+                return await db.scalar(select(BattleMatch.status).where(BattleMatch.id == self.match_id))
+        return self.run(_status())
 
 
 @pytest.fixture
@@ -310,10 +315,8 @@ def test_time_driven_push_arrives_without_polling(ws_env, monkeypatch):
 
             # Backdate started_at into the past -- neither client sends
             # anything further; the next progression-timer tick on each
-            # connected process independently notices and pushes BOTH
-            # match_started and (since the question index also just changed,
-            # from None to 0) question_started, lockstep play's per-question
-            # boundary push.
+            # connected process independently notices and pushes
+            # match_started plus everyone's first question.
             ws_env.backdate_started_at(seconds_ago=1)
 
             events_a = [ws_a.receive_json(), ws_a.receive_json()]
@@ -321,8 +324,11 @@ def test_time_driven_push_arrives_without_polling(ws_env, monkeypatch):
 
     for events in (events_a, events_b):
         types = [e["type"] for e in events]
-        assert types == ["match_started", "question_started"]
+        assert types == ["match_started", "next_question"]
+        assert events[0]["ends_at"] == events[1]["ends_at"]
         assert events[1]["question_index"] == 0
+        assert events[1]["question"]["question_id"] == questions[0].id
+        assert events[1]["finished"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,220 +352,365 @@ def test_closing_one_socket_notifies_the_other(ws_env):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Answer submission over WS -- editable answers, deferred grading/reveal
+# Next / Skip over WS -- self-paced, save first then hand out the next question
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_ws_answer_acknowledged_without_revealing_correctness(ws_env):
+def _connect_pair_to_active(ws_env, ws_a, ws_b, questions):
+    for ws in (ws_a, ws_b):
+        ws.receive_json()  # connected
+        ws.receive_json()  # state_sync
+    _ready_up_to_active(ws_a, ws_b, questions)
+    ws_env.backdate_started_at(seconds_ago=1)
+    for ws in (ws_a, ws_b):
+        assert ws.receive_json()["type"] == "match_started"
+        first = ws.receive_json()
+        assert first["type"] == "next_question" and first["question_index"] == 0
+
+
+def test_ws_next_returns_the_next_question_and_moves_the_opponents_bar(ws_env):
     questions = _fixed_questions()
     ws_env.seed_questions(questions)
 
-    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
-        ws_a.receive_json()
-        ws_a.receive_json()
-        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
-            ws_b.receive_json()
-            ws_b.receive_json()
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
 
-            _ready_up_to_active(ws_a, ws_b, questions)
-            ws_env.backdate_started_at(seconds_ago=1)
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        events_a = _events_by_type(ws_a, 2)
+        progress_b = ws_b.receive_json()
 
-            # Lockstep play pushes match_started then question_started (the
-            # single current question, index 0) -- consume both on each side.
-            match_started_a = ws_a.receive_json()
-            question_started_a = ws_a.receive_json()
-            ws_b.receive_json()
-            ws_b.receive_json()
-            assert match_started_a["type"] == "match_started"
-            assert question_started_a["type"] == "question_started"
-            question_id = questions[0].id
-            assert question_started_a["question"]["question_id"] == question_id
-
-            # Grading is deferred to the reveal boundary now -- submitting
-            # (well before it, question 0's window is Q seconds long) just
-            # gets a lightweight ack, never correctness, and the opponent
-            # gets nothing at all yet (no more instant opponent_answered).
-            ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "A"})
-            ack = ws_a.receive_json()
-
-    assert ack["type"] == "answer_acknowledged"
-    assert ack["question_id"] == question_id
-    assert ack["selected_option"] == "A"
-    assert "is_correct" not in ack
-    assert "correct_answer" not in ack
+    nxt = events_a["next_question"]
+    assert nxt["question_index"] == 1
+    assert nxt["question"]["question_id"] == questions[1].id
+    assert nxt["finished"] is False
+    assert progress_b == events_a["player_progress"] == {
+        "type": "player_progress", "user_id": ws_env.user_a_id, "question_order": 0,
+        "answered": True, "answered_count": 1,
+    }
+    # No right/wrong feedback while the match is live.
+    assert "correct" not in str(events_a) and "score" not in str(events_a)
 
 
-def test_ws_editable_answer_locks_and_reveals_both_players_at_boundary(ws_env, monkeypatch):
-    # Small, test-local timings so crossing the reveal boundary doesn't
-    # require a real ~25s wait -- monkeypatch reverts automatically, and
-    # battle_gameplay_service/battle_ws read these settings live (not cached
-    # at import time), so this affects the real progression timer running
-    # in the background for this test's connections. Deliberately only ONE
-    # backdate call: a second one racing against the progression timer's
-    # ALREADY-scheduled sleep (computed from the first tick's stale
-    # "remaining") can't wake it early, so real wall-clock time can blow
-    # past the intended target before the timer ever re-reads the DB.
-    # Instead, size the answerable window (question_seconds - reveal_seconds)
-    # generously above the two answer round-trips below, and let the timer's
-    # own natural sleep carry it into the reveal boundary.
-    question_seconds = 5.0
-    reveal_seconds = 4.5
-    monkeypatch.setattr(settings, "BATTLE_QUESTION_TIME_LIMIT_SECONDS", question_seconds)
-    monkeypatch.setattr(settings, "BATTLE_ANSWER_REVEAL_SECONDS", reveal_seconds)
-    # The "countdown" phase only polls every BATTLE_WS_WAITING_POLL_INTERVAL_
-    # SECONDS (1.0s default) -- without shrinking it, up to a full extra
-    # real second can elapse between backdating started_at into the past and
-    # the timer actually noticing the countdown->active transition, eating
-    # into the (question_seconds - reveal_seconds) answerable window before
-    # the test ever gets a chance to submit anything.
-    monkeypatch.setattr(settings, "BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS", 0.02)
-
+def test_ws_skip_moves_on_and_reports_a_skip(ws_env):
     questions = _fixed_questions()
     ws_env.seed_questions(questions)
 
-    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
-        ws_a.receive_json()
-        ws_a.receive_json()
-        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
-            ws_b.receive_json()
-            ws_b.receive_json()
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
 
-            _ready_up_to_active(ws_a, ws_b, questions)
-            ws_env.backdate_started_at(seconds_ago=0.05)
+        ws_a.send_json({"type": "skip", "question_id": questions[0].id})
+        events_a = _events_by_type(ws_a, 2)
+        progress_b = ws_b.receive_json()
 
-            ws_a.receive_json()  # match_started
-            question_started_a = ws_a.receive_json()
-            ws_b.receive_json()
-            ws_b.receive_json()
-            question_id = questions[0].id
-            assert question_started_a["question"]["question_id"] == question_id
-
-            ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "B"})
-            ack1 = ws_a.receive_json()
-            assert ack1["selected_option"] == "B"
-
-            # Changed their mind before the reveal boundary -- editable
-            # answers: this must succeed (overwrite), not 409.
-            ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "A"})
-            ack2 = ws_a.receive_json()
-            assert ack2["selected_option"] == "A"
-
-            # No further action needed -- the progression timer's own sleep
-            # (~ (question_seconds - 0.05) - reveal_seconds ≈ 0.45s) carries
-            # it into the reveal boundary on its own; both players' answers
-            # lock and get graded/revealed together, simultaneously.
-            result_a = ws_a.receive_json()
-            result_b = ws_b.receive_json()
-
-    for event in (result_a, result_b):
-        assert event["type"] == "question_result"
-        assert event["question_order"] == 0
-        by_user = {r["user_id"]: r for r in event["results"]}
-        # Graded on the LAST submission ("A", the correct one), not the
-        # first ("B") -- and never leaks selected_option to either side.
-        assert by_user[ws_env.user_a_id]["answered"] is True
-        assert by_user[ws_env.user_a_id]["is_correct"] is True
-        assert by_user[ws_env.user_a_id]["base_score"] == settings.BATTLE_SCORE_BASE_CORRECT
-        assert "selected_option" not in by_user[ws_env.user_a_id]
-        # user_b never submitted anything -- graded as unanswered/incorrect,
-        # locked in at the same instant as user_a's.
-        assert by_user[ws_env.user_b_id]["answered"] is False
-        assert by_user[ws_env.user_b_id]["is_correct"] is False
+    assert events_a["next_question"]["question_index"] == 1
+    assert progress_b["answered"] is False
 
 
-def test_ws_resubmitting_after_lock_is_rejected(ws_env, monkeypatch):
-    question_seconds = 5.0
-    reveal_seconds = 4.5
-    monkeypatch.setattr(settings, "BATTLE_QUESTION_TIME_LIMIT_SECONDS", question_seconds)
-    monkeypatch.setattr(settings, "BATTLE_ANSWER_REVEAL_SECONDS", reveal_seconds)
-
+def test_ws_spammed_next_saves_once_and_resends_the_same_question(ws_env):
     questions = _fixed_questions()
     ws_env.seed_questions(questions)
 
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+
+        for _ in range(3):
+            ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        events_a = [ws_a.receive_json() for _ in range(4)]  # 3 x next_question + 1 x player_progress
+
+        # The opponent heard about exactly one answer: the very next thing it
+        # gets after its own Skip is its own progress, not a second one of A's.
+        progress_b = ws_b.receive_json()
+        ws_b.send_json({"type": "skip", "question_id": questions[0].id})
+        events_b = _events_by_type(ws_b, 2)
+
+    next_events = [e for e in events_a if e["type"] == "next_question"]
+    assert len(next_events) == 3
+    assert {e["question_index"] for e in next_events} == {1}
+    assert [e["type"] for e in events_a].count("player_progress") == 1
+    assert progress_b["user_id"] == ws_env.user_a_id
+    assert events_b["player_progress"]["user_id"] == ws_env.user_b_id
+
+
+def test_ws_wrong_question_reports_an_error_without_dropping_the_socket(ws_env):
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+
+        ws_a.send_json({"type": "answer", "question_id": questions[5].id, "selected_option": "A"})
+        error = ws_a.receive_json()
+        # Still usable afterwards.
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        events_a = _events_by_type(ws_a, 2)
+
+    assert error == {"type": "error", "detail": "This is not your current question."}
+    assert events_a["next_question"]["question_index"] == 1
+
+
+def _fail_first_save(monkeypatch, failure):
+    """Makes the first Next/Skip save run `failure` instead; later ones are real."""
+    real_submit = battle_gameplay_service.submit_battle_answer
+    calls = {"n": 0}
+
+    async def flaky_submit(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await failure()
+        return await real_submit(*args, **kwargs)
+
+    monkeypatch.setattr(battle_gameplay_service, "submit_battle_answer", flaky_submit)
+
+
+@pytest.mark.parametrize("error", [ConnectionResetError("connection reset by peer"), TimeoutError()])
+def test_ws_save_failing_with_a_raw_network_error_keeps_the_socket_open(ws_env, monkeypatch, error):
+    # A stalled/dropped Neon connection can surface as a plain OSError, not a
+    # SQLAlchemyError -- it used to escape the receive loop and close the socket.
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+
+    async def fail():
+        raise error
+
+    _fail_first_save(monkeypatch, fail)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        failed = ws_a.receive_json()
+        # The client's resend goes through on the same socket.
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        events_a = _events_by_type(ws_a, 2)
+        progress_b = ws_b.receive_json()  # not a player_disconnected
+
+    assert failed == {"type": "error", "detail": "Couldn't save your answer — retrying."}
+    assert events_a["next_question"]["question_index"] == 1
+    assert progress_b["type"] == "player_progress"
+
+
+def test_ws_save_slower_than_the_timeout_is_abandoned_not_left_hanging(ws_env, monkeypatch):
+    monkeypatch.setattr(settings, "BATTLE_ANSWER_SAVE_TIMEOUT_SECONDS", 0.2)
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+
+    async def stall():
+        await asyncio.sleep(5)
+
+    _fail_first_save(monkeypatch, stall)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+
+        started = time.monotonic()
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        failed = ws_a.receive_json()
+        elapsed = time.monotonic() - started
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        events_a = _events_by_type(ws_a, 2)
+
+    assert failed == {"type": "error", "detail": "Couldn't save your answer — retrying."}
+    assert elapsed < 3
+    assert events_a["next_question"]["question_index"] == 1
+
+
+def test_ws_slow_work_after_the_commit_is_not_reported_as_a_failed_save(ws_env, monkeypatch):
+    # The timeout covers the save up to its commit: once the answer is saved,
+    # a slow read-back must still end in next_question, not "Couldn't save".
+    monkeypatch.setattr(settings, "BATTLE_ANSWER_SAVE_TIMEOUT_SECONDS", 0.2)
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+    real_current = battle_gameplay_service.current_question_for
+
+    async def slow_current(*args, **kwargs):
+        await asyncio.sleep(0.6)
+        return await real_current(*args, **kwargs)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+        monkeypatch.setattr(battle_gameplay_service, "current_question_for", slow_current)
+
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        events_a = _events_by_type(ws_a, 2)
+
+    assert set(events_a) == {"next_question", "player_progress"}
+    assert events_a["next_question"]["question_index"] == 1
+
+
+def test_ws_failure_after_the_answer_is_saved_resyncs_instead_of_saying_it_failed(ws_env, monkeypatch):
+    # The answer commits, then the work after it fails: the player must not be
+    # told "Couldn't save" -- they're resynced onto their next question.
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+    real_current = battle_gameplay_service.current_question_for
+    calls = {"n": 0}
+
+    async def failing_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionResetError("dropped after commit")
+        return await real_current(*args, **kwargs)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+        monkeypatch.setattr(battle_gameplay_service, "current_question_for", failing_once)
+
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        reply = ws_a.receive_json()
+
+    assert reply["type"] == "state_sync"
+    assert reply["state"]["status"] == "active" and reply["state"]["question_index"] == 1
+
+
+def test_ws_unexpected_error_handling_a_move_keeps_the_socket_open(ws_env, monkeypatch):
+    # e.g. closing the save's DB session after a cancelled query fails.
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+    real_handle_move = battle_ws_module._handle_move
+    calls = {"n": 0}
+
+    async def flaky_handle_move(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("session close failed")
+        await real_handle_move(*args, **kwargs)
+
+    monkeypatch.setattr(battle_ws_module, "_handle_move", flaky_handle_move)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        failed = ws_a.receive_json()
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        events_a = _events_by_type(ws_a, 2)
+
+    assert failed == {"type": "error", "detail": "Couldn't save your answer — retrying."}
+    assert events_a["next_question"]["question_index"] == 1
+
+
+def test_ws_failed_progress_announcement_still_delivers_the_next_question(ws_env, monkeypatch):
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+    real_publish = ws_manager.publish
+
+    async def publish(redis, *, match_id, event):
+        if event.get("type") == "player_progress":
+            raise battle_ws_module.RedisError("redis went away")
+        await real_publish(redis, match_id=match_id, event=event)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+        monkeypatch.setattr(ws_manager, "publish", publish)
+
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        first = ws_a.receive_json()
+        # The socket is still alive: the next answer is saved and answered too.
+        ws_a.send_json({"type": "answer", "question_id": questions[1].id, "selected_option": "A"})
+        second = ws_a.receive_json()
+
+    assert first["type"] == second["type"] == "next_question"
+    assert (first["question_index"], second["question_index"]) == (1, 2)
+
+
+def test_ws_match_ends_as_soon_as_both_players_finish(ws_env, monkeypatch):
+    # Ten answers back to back is faster than any human -- lift the
+    # per-socket message throttle so it doesn't kick in.
+    monkeypatch.setattr(settings, "BATTLE_WS_MESSAGE_RATE_LIMIT_MAX_CALLS", 100)
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+
+        for q in questions:
+            ws_a.send_json({"type": "answer", "question_id": q.id, "selected_option": "A"})
+            last_a = _events_by_type(ws_a, 2)["next_question"]
+            ws_b.receive_json()  # A's progress
+        assert last_a["finished"] is True and last_a["question"] is None
+
+        for q in questions[:-1]:
+            ws_b.send_json({"type": "skip", "question_id": q.id})
+            _events_by_type(ws_b, 2)
+            ws_a.receive_json()  # B's progress
+        ws_b.send_json({"type": "skip", "question_id": questions[-1].id})
+        events_b = _events_by_type(ws_b, 3)
+        events_a = _events_by_type(ws_a, 2)
+
+    assert events_b["next_question"]["finished"] is True
+    for events in (events_a, events_b):
+        assert events["match_finished"]["winner_user_id"] == ws_env.user_a_id
+
+
+def test_ws_pong_records_the_players_round_trip(ws_env, monkeypatch):
+    monkeypatch.setattr(settings, "BATTLE_RTT_FIRST_PING_DELAY_SECONDS", 0.01)
+
     with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
-        ws_a.receive_json()
-        ws_a.receive_json()
-        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
-            ws_b.receive_json()
-            ws_b.receive_json()
+        ws_a.receive_json()  # connected
+        ws_a.receive_json()  # state_sync
+        ping = ws_a.receive_json()
+        assert ping["type"] == "ping"
 
-            _ready_up_to_active(ws_a, ws_b, questions)
-            # Backdate straight into the reveal window -- already locked
-            # (remaining well below reveal_seconds) from the very first
-            # "active" tick, with plenty of real wall-clock time left (4s)
-            # before the next question begins, however long the
-            # resubmission attempt below takes.
-            ws_env.backdate_started_at(seconds_ago=1.0)
+        ws_a.send_json({"type": "pong", "nonce": 9999})  # not one of ours -- ignored
+        ws_a.send_json({"type": "pong", "nonce": ping["nonce"]})
+        ws_a.send_json({"type": "pong", "nonce": ping["nonce"]})  # already used -- ignored
+        # Round-trip something so the pongs above have been handled.
+        ws_a.send_json({"type": "ready"})
+        assert ws_a.receive_json()["type"] == "player_ready"
 
-            ws_a.receive_json()  # match_started
-            question_started_a = ws_a.receive_json()
-            ws_b.receive_json()
-            ws_b.receive_json()
-            question_id = questions[0].id
-
-            # Already past the reveal boundary (remaining=4.0 < reveal=4.5)
-            # -- the very first "active" tick grades and reveals immediately.
-            ws_a.receive_json()  # question_result
-            ws_b.receive_json()  # question_result
-
-            ws_a.send_json({"type": "answer", "question_id": question_id, "selected_option": "A"})
-            error = ws_a.receive_json()
-
-    assert error["type"] == "error"
-    assert "locked" in error["detail"].lower()
+    samples = ws_env.run(ws_env.redis.lrange(f"battle:rtt:{ws_env.match_id}:{ws_env.user_a_id}", 0, -1))
+    assert len(samples) == 1
+    assert 0 <= float(samples[0]) < 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reconnect within the grace period -- state restoration
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_reconnect_within_grace_period_restores_state_and_notifies_opponent(ws_env, monkeypatch):
-    # Widened well past this test's real wall-clock runtime -- the
-    # grading/reveal boundary fires once real elapsed time since (backdated)
-    # started_at crosses BATTLE_QUESTION_TIME_LIMIT_SECONDS -
-    # BATTLE_ANSWER_REVEAL_SECONDS (25s at the real defaults), which this
-    # test's own socket-handshake overhead can approach or exceed on a
-    # loaded machine, non-deterministically flipping the final event from
-    # state_sync to question_result. This test only cares about reconnect/
-    # state-restoration behavior, not question timing, so removing that race
-    # entirely is correct rather than just padding the margin.
-    monkeypatch.setattr(settings, "BATTLE_QUESTION_TIME_LIMIT_SECONDS", 300.0)
+def test_reconnect_within_grace_period_restores_state_and_notifies_opponent(ws_env):
     questions = _fixed_questions()
     ws_env.seed_questions(questions)
 
-    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
-        ws_a.receive_json()
-        ws_a.receive_json()
-        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
-            ws_b.receive_json()
-            ws_b.receive_json()
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+        # A answers question 0 before dropping -- the reconnect must put
+        # A back on THEIR question (1), not the match's first one.
+        ws_a.send_json({"type": "answer", "question_id": questions[0].id, "selected_option": "A"})
+        _events_by_type(ws_a, 2)
+        ws_b.receive_json()  # A's progress
 
-            _ready_up_to_active(ws_a, ws_b, questions)
-            ws_env.backdate_started_at(seconds_ago=1)
-            ws_a.receive_json()  # match_started
-            ws_a.receive_json()  # question_started
-            ws_b.receive_json()  # match_started
-            ws_b.receive_json()  # question_started
+        ws_a.close()
+        disconnected_event = ws_b.receive_json()
+        assert disconnected_event["type"] == "player_disconnected"
 
-            ws_a.close()
-            disconnected_event = ws_b.receive_json()
-            assert disconnected_event["type"] == "player_disconnected"
+        # A reconnects well within the grace period.
+        with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a2:
+            reconnected_event = ws_b.receive_json()
+            assert reconnected_event["type"] == "player_reconnected"
+            assert reconnected_event["user_id"] == ws_env.user_a_id
 
-            # A reconnects well within the grace period.
-            with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a2:
-                reconnected_event = ws_b.receive_json()
-                assert reconnected_event["type"] == "player_reconnected"
-                assert reconnected_event["user_id"] == ws_env.user_a_id
-
-                # A2 also gets its own reconnect broadcast alongside the two
-                # direct sends every fresh connection receives.
-                events_a2 = _events_by_type(ws_a2, 3)
+            # A2 also gets its own reconnect broadcast alongside the two
+            # direct sends every fresh connection receives.
+            events_a2 = _events_by_type(ws_a2, 3)
 
     assert events_a2["player_reconnected"]["user_id"] == ws_env.user_a_id
     assert events_a2["connected"]["match_id"] == ws_env.match_id
     restored_state = events_a2["state_sync"]["state"]
     assert restored_state["status"] == "active"
-    assert restored_state["question_index"] == 0
-    assert restored_state["question"] is not None
+    assert restored_state["question_index"] == 1
+    assert restored_state["question"]["question_id"] == questions[1].id
+    assert restored_state["my_answers"] == [{"question_order": 0, "is_correct": None, "answered": True}]
 
 
 def test_quick_reconnect_within_debounce_window_is_silent(ws_env, monkeypatch):
@@ -653,65 +804,24 @@ def test_socket_closed_mid_handshake_by_terminal_sweep_does_not_crash(ws_env):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Question boundary advances + total-time-budget completion over WS
+# Match clock running out over WS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_ws_pushes_next_question_started_at_the_window_boundary(ws_env):
+def test_ws_pushes_match_finished_once_the_match_clock_runs_out(ws_env, monkeypatch):
+    # A short clock so the progression timer's own sleep carries it to the end
+    # (a backdate can't wake a timer that's already asleep).
+    monkeypatch.setattr(settings, "BATTLE_MATCH_DURATION_SECONDS", 3.0)
+    monkeypatch.setattr(settings, "BATTLE_ANSWER_LATE_GRACE_SECONDS", 0.1)
     questions = _fixed_questions()
     ws_env.seed_questions(questions)
 
-    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
-        ws_a.receive_json()
-        ws_a.receive_json()
-        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
-            ws_b.receive_json()
-            ws_b.receive_json()
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
 
-            _ready_up_to_active(ws_a, ws_b, questions)
-            ws_env.backdate_started_at(seconds_ago=1)
-            ws_a.receive_json()  # match_started
-            first_question_a = ws_a.receive_json()
-            ws_b.receive_json()  # match_started
-            first_question_b = ws_b.receive_json()
-            assert first_question_a["question"]["question_id"] == questions[0].id
-            assert first_question_b["question"]["question_id"] == questions[0].id
-
-            # Backdate past question 0's window -- both connected processes'
-            # progression timers independently notice and push the next one.
-            ws_env.backdate_started_at(seconds_ago=Q + 1)
-            second_question_a = ws_a.receive_json()
-            second_question_b = ws_b.receive_json()
-
-    assert second_question_a["type"] == "question_started"
-    assert second_question_a["question_index"] == 1
-    assert second_question_a["question"]["question_id"] == questions[1].id
-    assert second_question_b["question"]["question_id"] == questions[1].id
-
-
-def test_ws_pushes_match_finished_once_total_time_budget_elapses(ws_env):
-    questions = _fixed_questions()
-    ws_env.seed_questions(questions)
-
-    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a:
-        ws_a.receive_json()
-        ws_a.receive_json()
-        with ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
-            ws_b.receive_json()
-            ws_b.receive_json()
-
-            _ready_up_to_active(ws_a, ws_b, questions)
-            ws_env.backdate_started_at(seconds_ago=1)
-            ws_a.receive_json()  # match_started
-            ws_a.receive_json()  # question_started
-            ws_b.receive_json()  # match_started
-            ws_b.receive_json()  # question_started
-
-            # Neither player answers anything -- backdate past the WHOLE
-            # question set's combined window so the progression timer's own
-            # elapsed-time check finalizes the match.
-            ws_env.backdate_started_at(seconds_ago=N * Q + 1)
-            finished_a = ws_a.receive_json()
-            finished_b = ws_b.receive_json()
+        # Neither player answers anything.
+        finished_a = ws_a.receive_json()
+        finished_b = ws_b.receive_json()
 
     assert finished_a["type"] == "match_finished"
     assert finished_b["type"] == "match_finished"
@@ -743,9 +853,9 @@ def test_disconnect_grace_period_expiry_triggers_forfeit(ws_env, monkeypatch):
             _ready_up_to_active(ws_a, ws_b, questions)
             ws_env.backdate_started_at(seconds_ago=1)
             ws_a.receive_json()  # match_started
-            ws_a.receive_json()  # question_started
+            ws_a.receive_json()  # next_question
             ws_b.receive_json()  # match_started
-            ws_b.receive_json()  # question_started
+            ws_b.receive_json()  # next_question
 
             ws_a.close()
             disconnected_event = ws_b.receive_json()
@@ -759,6 +869,33 @@ def test_disconnect_grace_period_expiry_triggers_forfeit(ws_env, monkeypatch):
     by_user = {p["user_id"]: p for p in finished["participants"]}
     assert by_user[ws_env.user_a_id]["result"] == "forfeit"
     assert by_user[ws_env.user_b_id]["result"] == "win"
+
+
+def test_finished_player_leaving_is_not_a_disconnect(ws_env, monkeypatch):
+    # Someone who has answered every question may go back to the home screen
+    # to wait: the opponent hears nothing and nobody is forfeited.
+    monkeypatch.setattr(settings, "BATTLE_DISCONNECT_GRACE_PERIOD_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "BATTLE_WS_MESSAGE_RATE_LIMIT_MAX_CALLS", 100)
+    questions = _fixed_questions()
+    ws_env.seed_questions(questions)
+
+    with ws_env.client.websocket_connect(ws_env.url(CLERK_A)) as ws_a, \
+            ws_env.client.websocket_connect(ws_env.url(CLERK_B)) as ws_b:
+        _connect_pair_to_active(ws_env, ws_a, ws_b, questions)
+        for q in questions:
+            ws_a.send_json({"type": "answer", "question_id": q.id, "selected_option": "A"})
+            _events_by_type(ws_a, 2)
+            ws_b.receive_json()  # A's progress
+        ws_a.close()
+        time.sleep(1.0)  # well past the (shrunk) grace period
+
+        # B's very next events are its own move -- no player_disconnected,
+        # no forfeit match_finished.
+        ws_b.send_json({"type": "skip", "question_id": questions[0].id})
+        events_b = _events_by_type(ws_b, 2)
+
+    assert set(events_b) == {"next_question", "player_progress"}
+    assert ws_env.match_status() == "active"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1054,10 +1191,10 @@ def test_forfeit_waiting_match_then_both_requeue_and_second_match_starts(queue_w
             ):
                 ws_b.send_json({"type": "ready"})
                 # Not asserting on an exact event sequence/count here -- real
-                # wall-clock time drives question/countdown windows, so a
-                # slow test run (e.g. verbose SQL debug logging) can let the
-                # progression timer coalesce past countdown_started straight
-                # to match_started/question_started by the time these reads
+                # wall-clock time drives the countdown, so a slow test run
+                # (e.g. verbose SQL debug logging) can let the progression
+                # timer coalesce past countdown_started straight to
+                # match_started/next_question by the time these reads
                 # happen. What actually matters -- that ready-gating on a
                 # freshly-rematched pair still activates the match at all --
                 # is asserted below directly against persisted DB state.

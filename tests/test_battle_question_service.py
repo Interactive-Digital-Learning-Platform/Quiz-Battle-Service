@@ -236,6 +236,91 @@ async def test_total_failure_raises_battle_question_selection_error(db_session):
         )
 
 
+async def test_short_tier_borrows_from_the_neighbouring_difficulty(db_session):
+    # No medium questions at all (a subject nobody has battled in yet) --
+    # the medium share comes from easy instead of cancelling the match.
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    db_session.add_all([_make_question(i, difficulty="easy") for i in range(4)])
+    await db_session.commit()
+
+    result = await select_battle_questions(
+        db_session, subject="Mathematics", tier_counts={"easy": 2, "medium": 2},
+        participant_user_ids=(user_a, user_b),
+    )
+
+    assert len(result) == 4
+    assert {q.difficulty for q in result} == {"easy"}
+    assert len({q.id for q in result}) == 4  # nothing picked twice
+
+
+async def test_borrowing_prefers_the_nearest_difficulty(db_session):
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    db_session.add_all([_make_question(2, difficulty="medium"), _make_question(4, difficulty="easy")])
+    await db_session.commit()
+
+    result = await select_battle_questions(
+        db_session, subject="Mathematics", tier_counts={"hard": 1},
+        participant_user_ids=(user_a, user_b),
+    )
+
+    assert [q.difficulty for q in result] == ["medium"]
+
+
+async def test_still_raises_when_no_difficulty_can_cover_the_shortfall(db_session):
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    db_session.add_all([_make_question(i, difficulty="easy") for i in range(3)])
+    await db_session.commit()
+
+    with pytest.raises(BattleQuestionSelectionError):
+        await select_battle_questions(
+            db_session, subject="Mathematics", tier_counts={"easy": 2, "medium": 2},
+            participant_user_ids=(user_a, user_b),
+        )
+
+
+# ── Startup pool warm-up ────────────────────────────────────────────────────
+
+async def test_warm_up_tops_up_only_thin_buckets_of_allowed_subjects(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "BATTLE_ALLOWED_SUBJECTS", "Mathematics,Geography")
+    monkeypatch.setattr(
+        battle_question_service, "AsyncSessionLocal",
+        async_sessionmaker(bind=db_session.bind, class_=AsyncSession, expire_on_commit=False),
+    )
+    monkeypatch.setattr(battle_question_service, "_replenishing_buckets", set())
+    replenish = AsyncMock()
+    monkeypatch.setattr(battle_question_service, "_replenish_pool_task", replenish)
+    # Mathematics/easy is already stocked; History isn't an allowed subject.
+    db_session.add_all([_make_question(i, difficulty="easy") for i in range(settings.BATTLE_POOL_MIN_SIZE)])
+    db_session.add(_make_question(0, subject="History", difficulty="easy"))
+    await db_session.commit()
+
+    await battle_question_service.warm_up_pools()
+
+    topped_up = {call.args for call in replenish.await_args_list}
+    assert topped_up == {
+        ("Geography", "easy"), ("Geography", "hard"), ("Geography", "medium"),
+        ("Mathematics", "hard"), ("Mathematics", "medium"),
+    }
+
+
+async def test_warm_up_skips_a_bucket_already_being_topped_up(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "BATTLE_ALLOWED_SUBJECTS", "Mathematics")
+    monkeypatch.setattr(
+        battle_question_service, "AsyncSessionLocal",
+        async_sessionmaker(bind=db_session.bind, class_=AsyncSession, expire_on_commit=False),
+    )
+    monkeypatch.setattr(battle_question_service, "_replenishing_buckets", {("Mathematics", "medium")})
+    replenish = AsyncMock()
+    monkeypatch.setattr(battle_question_service, "_replenish_pool_task", replenish)
+
+    await battle_question_service.warm_up_pools()
+
+    assert ("Mathematics", "medium") not in {call.args for call in replenish.await_args_list}
+
+
 # ── Debounced background pool replenish ─────────────────────────────────────
 
 async def test_low_bucket_triggers_exactly_one_replenish_call(db_session):

@@ -4,7 +4,8 @@ app/services/battle_gameplay_service.py
 Server-authoritative battle lifecycle: explicit ready-gated activation
 (both participants must call mark_ready before a match proceeds -- no more
 auto-activation on first poll, that was Phase 3's interim behavior), a
-server-driven countdown, timestamp-derived question progression, answer
+server-driven countdown, self-paced question progression (each player
+moves on with Next/Skip; the whole match runs on one clock), answer
 grading/scoring, match completion (winner + Elo + CompetitiveSubjectRating
 updates), and forfeit. Works over REST polling AND WebSocket push
 (app/api/routes/battle_ws.py) simultaneously -- this module has no
@@ -32,10 +33,12 @@ like Phase 3's original activation CAS did; whether one or both processes
 observe "both ready" in Redis doesn't matter, only one CAS ever wins.
 """
 import asyncio
-import json
 import logging
 import math
 import random
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
@@ -57,12 +60,10 @@ from app.models.battle_match import (
 from app.models.competitive_rating import CompetitiveSubjectRating
 from app.models.question import Question
 from app.models.user import User
-from app.schemas.battle import ParticipantQuestionResult
 from app.schemas.battle_ws import (
     CountdownStartedEvent,
     MatchCancelledEvent,
     PlayerReadyEvent,
-    QuestionResultEvent,
 )
 from app.services import battle_difficulty, elo_engine, league_engine
 from app.services.battle_connection_manager import manager as ws_manager
@@ -119,42 +120,34 @@ def _connection_generation_key(match_id: int, user_id: int) -> str:
     return f"battle:conn_gen:{match_id}:{user_id}"
 
 
-def _pending_answer_key(match_id: int, question_id: int, user_id: int) -> str:
-    return f"battle:pending_answer:{match_id}:{question_id}:{user_id}"
+def _rtt_samples_key(match_id: int, user_id: int) -> str:
+    return f"battle:rtt:{match_id}:{user_id}"
 
 
-async def _set_pending_answer(
-    redis: Redis, *, match_id: int, question_id: int, user_id: int,
-    selected_option: str, response_time_ms: int,
-) -> None:
-    """Upsert (plain SET, no history) -- while a question is still
-    answerable, players may change their mind any number of times, and each
-    (re)submission just overwrites this key. Whichever value is here when
-    _grade_and_reveal_question pops it at the reveal boundary is the "final
-    answer" for both correctness and the speed bonus -- exactly "time to
-    final answer". TTL is a safety-net only (mirrors this module's other
-    transient Redis keys) -- grading always pops the key itself once the
-    question locks; nothing else in this module depends on it expiring.
+async def record_rtt_sample(redis: Redis, *, match_id: int, user_id: int, rtt_seconds: float) -> None:
+    """Keeps this player's last BATTLE_RTT_SAMPLE_COUNT measured round trips
+    (server ping -> client pong, see battle_ws.py) -- the fastest of them is
+    the network allowance taken off each answer's response time.
     """
-    key = _pending_answer_key(match_id, question_id, user_id)
-    payload = json.dumps({"selected_option": selected_option, "response_time_ms": response_time_ms})
-    await redis.set(key, payload, ex=int(settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS * 2))
+    key = _rtt_samples_key(match_id, user_id)
+    await redis.lpush(key, f"{max(0.0, rtt_seconds):.4f}")
+    await redis.ltrim(key, 0, settings.BATTLE_RTT_SAMPLE_COUNT - 1)
+    await redis.expire(key, settings.BATTLE_CONNECTION_GENERATION_TTL_SECONDS)
 
 
-async def _pop_pending_answer(
-    redis: Redis, *, match_id: int, question_id: int, user_id: int,
-) -> dict | None:
-    """Read-then-delete -- None means this player never submitted (or their
-    submission already expired/was already popped by a prior grading pass),
-    graded as "unanswered" (incorrect, 0 points) by the caller, same as a
-    missed question always has been.
+async def network_allowance_seconds(redis: Redis | None, *, match_id: int, user_id: int) -> float:
+    """The fastest recent round trip, capped at
+    BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS. The minimum (not the average) so a
+    single slow ping can't inflate it, and the cap bounds what a client that
+    deliberately delays its pongs could ever gain. 0 with no samples yet
+    (e.g. a REST-only client).
     """
-    key = _pending_answer_key(match_id, question_id, user_id)
-    raw = await redis.get(key)
-    if raw is None:
-        return None
-    await redis.delete(key)
-    return json.loads(raw)
+    if redis is None:
+        return 0.0
+    samples = [float(v) for v in await redis.lrange(_rtt_samples_key(match_id, user_id), 0, -1)]
+    if not samples:
+        return 0.0
+    return min(min(samples), settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS)
 
 
 # ── internal lookups ─────────────────────────────────────────────────────
@@ -234,7 +227,14 @@ async def _try_activate_if_ready_and_connected(
 
 
 async def _finalize_activation(db: AsyncSession, redis: Redis, *, match: BattleMatch) -> BattleMatch:
-    match = await _activate_countdown(db, match, redis)
+    match, started_it = await _activate_countdown(db, match, redis)
+    # Only the call that actually started the countdown announces it. Picking
+    # questions can now take seconds (AI first), and a second trigger arriving
+    # meanwhile (the other player's connect, the stale-match reaper's forced
+    # activation) waits on the first and then finds it already done -- it
+    # mustn't announce the countdown (or a cancellation) a second time.
+    if not started_it:
+        return match
     if match.status == "countdown":
         await ws_manager.publish(
             redis, match_id=match.id,
@@ -294,7 +294,9 @@ async def mark_connected(db: AsyncSession, redis: Redis, *, match_id: int, user_
     return await _try_activate_if_ready_and_connected(db, redis, match=match, participants=participants)
 
 
-async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis) -> BattleMatch:
+async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis) -> tuple[BattleMatch, bool]:
+    """Claims a "waiting" match and picks its questions. Returns the match and
+    whether THIS call made the transition (False: another call already had)."""
     # started_at is deliberately NOT set here -- see below, right before the
     # final commit, for why. This whole function runs as one open, uncommitted
     # transaction until then, so no other reader (REST poll, another
@@ -313,7 +315,7 @@ async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis
         # the winner committed. MUST refresh, not db.get() (identity map).
         await db.commit()
         await db.refresh(match)
-        return match
+        return match, False
 
     await db.refresh(match)  # pick up status this UPDATE just set (same transaction, uncommitted)
     # match.difficulty is already the band label get_difficulty_label()
@@ -343,7 +345,7 @@ async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis
         participants = await _get_participants(db, match.id)
         for p in participants:
             await release_match_state(redis, user_id=p.user_id)
-        return match
+        return match, True
 
     for order, question in enumerate(questions):
         db.add(BattleMatchQuestion(match_id=match.id, question_id=question.id, question_order=order))
@@ -355,8 +357,8 @@ async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis
     # can observe "countdown" before this same commit anyway (single open
     # transaction throughout), so there's no earlier, briefly-wrong value
     # for anyone to have raced on. Getting this wrong silently deducted
-    # selection's own latency from question 1's 30s window before either
-    # player had even been told the match was starting.
+    # selection's own latency from the match clock (and question 1's speed
+    # bonus) before either player had even been told the match was starting.
     match.started_at = datetime.now(UTC) + timedelta(seconds=settings.BATTLE_COUNTDOWN_DURATION_SECONDS)
     await db.commit()
     await db.refresh(match)
@@ -364,7 +366,7 @@ async def _activate_countdown(db: AsyncSession, match: BattleMatch, redis: Redis
         "Battle match %d entered countdown — subject=%s difficulty=%s starts_at=%s",
         match.id, match.subject, match.difficulty, match.started_at,
     )
-    return match
+    return match, True
 
 
 # ── countdown -> active, exactly-once ─────────────────────────────────────
@@ -453,12 +455,10 @@ def _apply_result(
     behave exactly like a normal loss while the stored result still
     distinguishes "lost by forfeit" from "lost by playing worse."
     """
-    # `answers` now includes a row for every GRADED question slot, even ones
-    # this player never actually submitted anything for (deferred-grading
-    # design -- see _grade_one_participant, selected_option=="" sentinel) --
-    # filter those back out here so a timeout doesn't inflate wrong_count or
-    # get counted toward average response time, preserving the original
-    # "a missed question simply isn't counted as answered at all" semantics.
+    # `answers` includes a row for every question this player skipped
+    # (selected_option=="" sentinel, see submit_battle_answer) -- filter
+    # those back out here so a skip doesn't inflate wrong_count or get
+    # counted toward average response time.
     submitted_answers = [a for a in answers if a.selected_option]
     answered_count = len(submitted_answers)
     # ALL answered questions count toward average response time (not just
@@ -599,15 +599,25 @@ async def _finalize_match(db: AsyncSession, match: BattleMatch, redis: Redis | N
 
 # ── forfeit (any pre-terminal status -> completed), exactly-once ─────────
 
+FINISHED_CANT_FORFEIT_DETAIL = "You've already finished — your result stands."
+
+
 async def forfeit_match(
     db: AsyncSession, redis: Redis, *, match_id: int, forfeiting_user_id: int
 ) -> BattleMatch:
     match = await _get_match_or_404(db, match_id)
     participants = await _get_participants(db, match_id)
-    _require_participant(participants, forfeiting_user_id)  # 403 if not a participant
+    me = _require_participant(participants, forfeiting_user_id)  # 403 if not a participant
 
     if match.status not in _ACTIVE_STATUSES:
         return match  # idempotent no-op -- already resolved
+
+    # A player who has already answered or skipped every question is just
+    # waiting for the opponent (possibly from the home screen) -- their
+    # result stands and can't be thrown away by a forfeit.
+    await db.refresh(me)
+    if me.current_question_index >= settings.BATTLE_QUESTION_COUNT:
+        raise HTTPException(status.HTTP_409_CONFLICT, FINISHED_CANT_FORFEIT_DETAIL)
 
     # "waiting" (matched but not yet both-ready) or a countdown that hasn't
     # reached started_at yet -- no question has been shown to either player,
@@ -778,6 +788,76 @@ async def is_still_disconnected(redis: Redis, *, match_id: int, user_id: int) ->
 
 # ── shared "notice time has moved on" helper, used by REST + WS alike ────
 
+def match_ends_at(match: BattleMatch) -> datetime:
+    """When the match clock the players see runs out."""
+    return as_utc(match.started_at) + timedelta(seconds=settings.BATTLE_MATCH_DURATION_SECONDS)
+
+
+def player_answers_close_at(match: BattleMatch, allowance_seconds: float) -> datetime:
+    """One player's cutoff: 0:00 as THEIR phone saw it. The phone's countdown
+    runs about one round trip behind the server's clock (it learns the time
+    from messages that took that long to arrive, then its answer takes the
+    same again), so an answer sent before its own 0:00 arrives up to that
+    allowance after the server's -- see network_allowance_seconds.
+    """
+    return match_ends_at(match) + timedelta(
+        seconds=settings.BATTLE_ANSWER_LATE_GRACE_SECONDS + allowance_seconds
+    )
+
+
+def answers_close_at(match: BattleMatch) -> datetime:
+    """When the server stops accepting answers from anyone -- the latest any
+    player's own cutoff (player_answers_close_at) can be. The match is only
+    finalized after this, so no answer that's still in time gets shut out.
+    """
+    return player_answers_close_at(match, settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS)
+
+
+async def match_end_reason(db: AsyncSession, match_id: int) -> str:
+    """Why a completed match ended: "forfeit" (someone forfeited, incl. a
+    disconnect that ran out its grace period), "all_finished" (both players
+    answered or skipped every question) or "time_up" (the match clock ran
+    out first). Worked out from the participants' own columns -- fresh, not
+    whatever the session has cached -- so clients never have to guess it
+    from progress they may only partly have seen.
+    """
+    rows = (
+        await db.execute(
+            select(BattleParticipant.result, BattleParticipant.current_question_index)
+            .where(BattleParticipant.match_id == match_id)
+        )
+    ).all()
+    if any(result == "forfeit" for result, _ in rows):
+        return "forfeit"
+    if rows and all(index >= settings.BATTLE_QUESTION_COUNT for _, index in rows):
+        return "all_finished"
+    return "time_up"
+
+
+async def has_finished(db: AsyncSession, *, match_id: int, user_id: int) -> bool:
+    """True once this player has answered or skipped every question. A column
+    query, so it's fresh even if the session holds an older participant row.
+    """
+    index = await db.scalar(
+        select(BattleParticipant.current_question_index).where(
+            BattleParticipant.match_id == match_id, BattleParticipant.user_id == user_id
+        )
+    )
+    return index is not None and index >= settings.BATTLE_QUESTION_COUNT
+
+
+async def _all_finished(db: AsyncSession, match_id: int) -> bool:
+    # A column query, not the ORM objects: those stay cached in the session
+    # (expire_on_commit=False), and the opponent may have finished since they
+    # were loaded -- two players finishing at once must not both miss it.
+    indexes = (
+        await db.execute(
+            select(BattleParticipant.current_question_index).where(BattleParticipant.match_id == match_id)
+        )
+    ).scalars().all()
+    return bool(indexes) and all(i >= settings.BATTLE_QUESTION_COUNT for i in indexes)
+
+
 async def _ensure_match_progressed(
     db: AsyncSession, match: BattleMatch, redis: Redis | None = None
 ) -> BattleMatch:
@@ -786,44 +866,11 @@ async def _ensure_match_progressed(
     # (REST or the WS progression timer) can no longer auto-activate it.
     if match.status == "countdown" and datetime.now(UTC) >= as_utc(match.started_at):
         match = await _activate_from_countdown(db, match)
-    if match.status == "active":
-        elapsed = (datetime.now(UTC) - as_utc(match.started_at)).total_seconds()
-        total_budget = settings.BATTLE_QUESTION_COUNT * settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
-        if elapsed >= total_budget:
-            match = await _finalize_match(db, match, redis)
+    if match.status == "active" and (
+        datetime.now(UTC) >= answers_close_at(match) or await _all_finished(db, match.id)
+    ):
+        match = await _finalize_match(db, match, redis)
     return match
-
-
-def _current_question_order(match: BattleMatch) -> int:
-    """Which question BOTH players should be on right now, purely derived
-    from elapsed wall-clock time since match.started_at -- lockstep play has
-    no per-player pacing at all. Callers that index into the frozen question
-    set must clamp this to [0, BATTLE_QUESTION_COUNT - 1] themselves (this
-    can exceed the last index once the match's total time budget has
-    elapsed but before _finalize_match has actually run).
-    """
-    elapsed = (datetime.now(UTC) - as_utc(match.started_at)).total_seconds()
-    return int(elapsed // settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS)
-
-
-def _question_time_remaining_seconds(match: BattleMatch, order: int) -> float:
-    """Seconds left in the fixed window for question `order` -- i.e. until
-    (order + 1) * BATTLE_QUESTION_TIME_LIMIT_SECONDS has elapsed since
-    match.started_at.
-    """
-    elapsed = (datetime.now(UTC) - as_utc(match.started_at)).total_seconds()
-    window_end = (order + 1) * settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
-    return max(0.0, window_end - elapsed)
-
-
-async def _answered_count(db: AsyncSession, *, match_id: int, user_id: int) -> int:
-    return (
-        await db.execute(
-            select(func.count())
-            .select_from(BattleAnswer)
-            .where(BattleAnswer.match_id == match_id, BattleAnswer.user_id == user_id)
-        )
-    ).scalar() or 0
 
 
 # ── GET .../state ────────────────────────────────────────────────────────
@@ -861,21 +908,15 @@ def _match_option_order(match: BattleMatch, question: Question) -> list:
 
 
 async def _progress_answers(db: AsyncSession, *, match_id: int, user_id: int) -> list[dict]:
-    """Every question slot GRADED so far for this player, as {question_order,
+    """Every question this player has moved past so far, as {question_order,
     is_correct, answered} ordered by question_order -- feeds both players'
-    progress bars (own answers directly, opponent's the same shape seeded on
-    load then kept live via the question_result WS event). Deferred-grading
-    design: a BattleAnswer row exists for every graded slot regardless of
-    whether this player actually submitted anything (see
-    _grade_one_participant, selected_option=="" sentinel for "never
-    answered") -- `answered` is what the progress bar uses to tell "answered
-    wrong" from "never answered at all" apart, since both grade is_correct=
-    False. A question slot with no entry here at all just hasn't been
-    graded/reached yet.
+    progress bars (seeded on load, then kept live via player_progress).
+    `answered` is False for a skip; is_correct is always None, since nobody
+    learns whether they were right until the match is over.
     """
     rows = (
         await db.execute(
-            select(BattleMatchQuestion.question_order, BattleAnswer.is_correct, BattleAnswer.selected_option)
+            select(BattleMatchQuestion.question_order, BattleAnswer.selected_option)
             .join(
                 BattleAnswer,
                 (BattleAnswer.match_id == BattleMatchQuestion.match_id)
@@ -887,9 +928,52 @@ async def _progress_answers(db: AsyncSession, *, match_id: int, user_id: int) ->
         )
     ).all()
     return [
-        {"question_order": order, "is_correct": is_correct, "answered": bool(selected_option)}
-        for order, is_correct, selected_option in rows
+        {"question_order": order, "is_correct": None, "answered": bool(selected_option)}
+        for order, selected_option in rows
     ]
+
+
+async def _question_review(db: AsyncSession, *, match: BattleMatch, user_id: int) -> list[dict]:
+    """The end-of-match review: every question in match order with its right
+    answer next to this player's own pick and points. Only ever built for
+    the viewer themself -- the opponent's picks are never sent.
+    """
+    rows = (
+        await db.execute(
+            select(BattleMatchQuestion.question_order, Question, BattleAnswer)
+            .join(Question, Question.id == BattleMatchQuestion.question_id)
+            .outerjoin(
+                BattleAnswer,
+                (BattleAnswer.match_id == BattleMatchQuestion.match_id)
+                & (BattleAnswer.question_id == BattleMatchQuestion.question_id)
+                & (BattleAnswer.user_id == user_id),
+            )
+            .where(BattleMatchQuestion.match_id == match.id)
+            .order_by(BattleMatchQuestion.question_order.asc())
+        )
+    ).all()
+    review = []
+    for order, question, answer in rows:
+        if answer is None:
+            status_label = "unanswered"
+        elif not answer.selected_option:
+            status_label = "skipped"
+        else:
+            status_label = "correct" if answer.is_correct else "incorrect"
+        review.append({
+            "question_order": order,
+            "question": question.question,
+            "options": _match_option_order(match, question),
+            "correct_answer": question.correct_answer,
+            "selected_option": (answer.selected_option or None) if answer is not None else None,
+            "status": status_label,
+            "response_time_ms": answer.response_time_ms if answer is not None and answer.selected_option else None,
+            "base_score": answer.base_score if answer is not None else 0,
+            "speed_bonus": answer.speed_bonus if answer is not None else 0,
+            "streak_bonus": answer.streak_bonus if answer is not None else 0,
+            "total_question_score": answer.total_question_score if answer is not None else 0,
+        })
+    return review
 
 
 def participant_result_payload(p: BattleParticipant, *, username: str | None = None) -> dict:
@@ -1001,67 +1085,45 @@ async def get_battle_history(
     }
 
 
+def next_question_payload(match: BattleMatch, participant: BattleParticipant, question: dict | None) -> dict:
+    """What the client needs to show the player's current question --
+    shared by the active state, the WS next_question event and the REST
+    answer/skip responses so they can't drift apart.
+    """
+    index = participant.current_question_index
+    return {
+        "question_index": index,
+        "question": question,
+        "finished": index >= settings.BATTLE_QUESTION_COUNT,
+        "ends_at": match_ends_at(match),
+        "server_time": datetime.now(UTC),
+    }
+
+
+async def current_question_for(db: AsyncSession, match: BattleMatch, participant: BattleParticipant) -> dict:
+    index = participant.current_question_index
+    question = await question_payload_for(db, match, index) if index < settings.BATTLE_QUESTION_COUNT else None
+    return next_question_payload(match, participant, question)
+
+
 async def _build_active_state(
     db: AsyncSession, *, match: BattleMatch, me: BattleParticipant, opponent: BattleParticipant | None,
 ) -> dict:
-    question_index = min(_current_question_order(match), settings.BATTLE_QUESTION_COUNT - 1)
-    question = await question_payload_for(db, match, question_index)
-    has_answered_current_question = False
-    current_question_results: list[ParticipantQuestionResult] | None = None
-    current_question_correct_answer: str | None = None
-    if question is not None:
-        graded_rows = (
-            await db.execute(
-                select(BattleAnswer).where(
-                    BattleAnswer.match_id == match.id, BattleAnswer.question_id == question["question_id"],
-                )
-            )
-        ).scalars().all()
-        has_answered_current_question = any(row.user_id == me.user_id for row in graded_rows)
-        if graded_rows:
-            # A reconnecting client needs to know the current question is
-            # already locked/revealed, not still answerable -- see
-            # BattleMatchStateResponse.current_question_results.
-            current_question_results = [
-                ParticipantQuestionResult(
-                    user_id=row.user_id, answered=bool(row.selected_option), is_correct=row.is_correct,
-                    base_score=row.base_score, speed_bonus=row.speed_bonus, streak_bonus=row.streak_bonus,
-                    total_question_score=row.total_question_score,
-                )
-                for row in graded_rows
-            ]
-            # Safe now -- question_payload_for's `question` dict above
-            # deliberately omits this (spec's "Do Not Send Correct Answers
-            # Early"), but graded_rows being non-empty means this slot is
-            # already locked, so a fresh, separate lookup here is fine.
-            current_question_correct_answer = (
-                await db.execute(select(Question.correct_answer).where(Question.id == question["question_id"]))
-            ).scalar_one_or_none()
-
-    my_answers = await _progress_answers(db, match_id=match.id, user_id=me.user_id)
-    opponent_answers = (
-        await _progress_answers(db, match_id=match.id, user_id=opponent.user_id)
-        if opponent is not None else []
-    )
-
+    current = await current_question_for(db, match, me)
+    remaining = (current["ends_at"] - current["server_time"]).total_seconds()
     return {
         "status": "active", "match_id": match.id, "subject": match.subject, "difficulty": match.difficulty,
         "question_count": settings.BATTLE_QUESTION_COUNT,
-        "time_remaining_seconds": round(_question_time_remaining_seconds(match, question_index), 2),
-        "question_index": question_index, "question": question,
-        "has_answered_current_question": has_answered_current_question,
-        "current_question_results": current_question_results,
-        "current_question_correct_answer": current_question_correct_answer,
-        "my_answers": my_answers, "opponent_answers": opponent_answers,
-        "my_progress": {
-            "user_id": me.user_id,
-            "answered_count": await _answered_count(db, match_id=match.id, user_id=me.user_id),
-        },
+        "time_remaining_seconds": round(max(0.0, remaining), 2),
+        **current,
+        "my_answers": await _progress_answers(db, match_id=match.id, user_id=me.user_id),
+        "opponent_answers": (
+            await _progress_answers(db, match_id=match.id, user_id=opponent.user_id)
+            if opponent is not None else []
+        ),
+        "my_progress": {"user_id": me.user_id, "answered_count": me.current_question_index},
         "opponent_progress": (
-            {
-                "user_id": opponent.user_id,
-                "answered_count": await _answered_count(db, match_id=match.id, user_id=opponent.user_id),
-            }
+            {"user_id": opponent.user_id, "answered_count": opponent.current_question_index}
             if opponent is not None else None
         ),
         "started_at": match.started_at,
@@ -1077,15 +1139,18 @@ async def _build_completed_state(
     )
     return {
         "status": "completed", "match_id": match.id, "subject": match.subject, "difficulty": match.difficulty,
+        "question_count": settings.BATTLE_QUESTION_COUNT,
         "started_at": match.started_at, "finished_at": match.finished_at,
         "result": {
             "winner_user_id": match.winner_user_id,
+            "end_reason": await match_end_reason(db, match.id),
             "me": participant_result_payload(me),
             "opponent": (
                 participant_result_payload(opponent, username=opponent_username)
                 if opponent is not None else None
             ),
         },
+        "review": await _question_review(db, match=match, user_id=me.user_id),
     }
 
 
@@ -1117,35 +1182,28 @@ async def get_match_state(
     return {"status": "waiting", "match_id": match.id}
 
 
-# ── POST .../answer (and the WS "answer" message) ─────────────────────────
+# ── POST .../answer + .../skip (and the WS "answer"/"skip" messages) ──────
 
-async def _streak_before(
-    db: AsyncSession, *, match_id: int, user_id: int, before_question_order: int
-) -> int:
-    """Consecutive-correct streak ENDING at the question slot right before
-    `before_question_order` (0 if that slot was wrong or never answered, or
-    if there are no prior slots yet). Outerjoined against the frozen
-    BattleMatchQuestion set (not just this user's BattleAnswer rows) and
-    ordered by question_order.desc() -- lockstep play, so a question whose
-    window already closed with no BattleAnswer row for this user (they
-    missed it) shows up as a NULL is_correct here and breaks the streak
-    exactly like a wrong answer, same as a genuinely wrong one.
+async def _streak_before(db: AsyncSession, *, match_id: int, user_id: int, order: int) -> int:
+    """How many questions in a row this player got right straight before the
+    one at `order` -- questions are answered strictly in order (no going
+    back), so it's the run of correct answers counting back from order - 1;
+    a wrong or skipped answer ends it.
     """
     rows = (
         await db.execute(
             select(BattleAnswer.is_correct)
-            .select_from(BattleMatchQuestion)
-            .outerjoin(
-                BattleAnswer,
-                (BattleAnswer.match_id == BattleMatchQuestion.match_id)
-                & (BattleAnswer.question_id == BattleMatchQuestion.question_id)
-                & (BattleAnswer.user_id == user_id),
+            .join(
+                BattleMatchQuestion,
+                (BattleMatchQuestion.match_id == BattleAnswer.match_id)
+                & (BattleMatchQuestion.question_id == BattleAnswer.question_id),
             )
             .where(
-                BattleMatchQuestion.match_id == match_id,
-                BattleMatchQuestion.question_order < before_question_order,
+                BattleAnswer.match_id == match_id, BattleAnswer.user_id == user_id,
+                BattleMatchQuestion.question_order < order,
             )
             .order_by(BattleMatchQuestion.question_order.desc())
+            .limit(settings.BATTLE_STREAK_BONUS_TIER4_MIN_STREAK)
         )
     ).scalars().all()
     streak = 0
@@ -1158,8 +1216,9 @@ async def _streak_before(
 
 async def _best_streak_for(db: AsyncSession, *, match_id: int, user_id: int) -> int:
     """Longest run of consecutive correct answers across the WHOLE frozen
-    question set in question_order -- mirrors _streak_before's
-    missed-question-breaks-the-streak semantics via the same outerjoin.
+    question set in question_order -- a skipped, wrong or never-reached
+    question breaks the streak (outerjoin, so a never-reached question shows
+    up as NULL).
     """
     rows = (
         await db.execute(
@@ -1185,210 +1244,237 @@ async def _best_streak_for(db: AsyncSession, *, match_id: int, user_id: int) -> 
     return best
 
 
-async def submit_battle_answer(
-    db: AsyncSession, *, match_id: int, user_id: int, question_id: int, selected_option: str,
-    redis: Redis | None = None,
-) -> dict:
-    """Editable-answer flow: this does NOT grade anything -- it just
-    upserts the player's current pick into Redis (see _set_pending_answer),
-    overwriting any earlier pick for this same question. Players may call
-    this as many times as they like (changing their mind freely) right up
-    until the question locks. Grading/reveal happens once, server-side, at
-    the reveal boundary -- see _grade_and_reveal_question -- using whichever
-    submission was in effect at that instant.
+@dataclass
+class AnswerOutcome:
+    # What the answering player should see next (next_question_payload's
+    # shape) -- the same thing again, unchanged, for a duplicate Next/Skip.
+    next: dict
+    # The match row after this call -- "completed" if this answer was the
+    # last one either player still owed, so callers can announce the result.
+    match: BattleMatch
+    # Set only when THIS call saved something -- the opponent's
+    # player_progress update. None for a duplicate.
+    progress: dict | None = None
 
-    `redis` is required in practice (both the REST route and the WS route
-    always pass a real client) -- without it, a submission is silently
-    dropped and the question grades as "unanswered" for this player, same
-    as never having called this at all.
+
+async def _duplicate(db: AsyncSession, match: BattleMatch, participant: BattleParticipant) -> AnswerOutcome:
+    # Refresh both: after a rollback every loaded object is expired, and an
+    # expired attribute can't be lazy-loaded under asyncio.
+    await db.refresh(match)
+    await db.refresh(participant)
+    return AnswerOutcome(next=await current_question_for(db, match, participant), match=match)
+
+
+# Sent when a Next/Skip reaches (or finishes saving) after the match clock
+# ran out -- the client shows the results with "Time's up".
+TIME_UP_DETAIL = "Time's up — this answer wasn't saved."
+
+
+class _SaveSteps:
+    """Diagnostic for slow answer saves: times each step (mostly one DB or
+    Redis round trip each) and, when the whole save took longer than
+    BATTLE_SLOW_SAVE_LOG_SECONDS or didn't finish normally, logs the
+    breakdown -- including the step it was still in when it was cut off.
     """
-    match = await _get_match_or_404(db, match_id)
-    participants = await _get_participants(db, match_id)
-    _require_participant(participants, user_id)  # 403 if not a participant
 
+    def __init__(self) -> None:
+        self._began = self._step_began = time.monotonic()
+        self._step: str | None = None
+        self._done: list[tuple[str, float]] = []
+
+    def start(self, name: str) -> None:
+        now = time.monotonic()
+        if self._step is not None:
+            self._done.append((self._step, now - self._step_began))
+        self._step, self._step_began = name, now
+
+    def log_if_slow(self, *, match_id: int, user_id: int, outcome: str) -> None:
+        now = time.monotonic()
+        total = now - self._began
+        if outcome == "ok" and total < settings.BATTLE_SLOW_SAVE_LOG_SECONDS:
+            return
+        if outcome == "HTTPException" and total < settings.BATTLE_SLOW_SAVE_LOG_SECONDS:
+            return  # an ordinary refusal (time's up, wrong question) -- not a problem
+        steps = [f"{name} {seconds:.2f}s" for name, seconds in self._done]
+        if self._step is not None:
+            steps.append(f"{self._step} {now - self._step_began:.2f}s" + (" (unfinished)" if outcome != "ok" else ""))
+        logger.warning(
+            "Slow battle answer save: %.1fs, outcome=%s — match_id=%d, user_id=%d — %s",
+            total, outcome, match_id, user_id, " | ".join(steps),
+        )
+
+
+async def submit_battle_answer(
+    db: AsyncSession, *, match_id: int, user_id: int, question_id: int, selected_option: str | None,
+    redis: Redis | None = None, on_saved: Callable[[], None] | None = None,
+) -> AnswerOutcome:
+    """Next (selected_option set) or Skip (selected_option None) for the
+    player's CURRENT question. Grades and scores it, saves it, and only then
+    moves the player on -- the returned `next` is their next question. The
+    answer row and the move to the next question commit together, guarded
+    by a compare-and-swap on current_question_index plus the BattleAnswer
+    unique constraint, so spamming Next (or the same message arriving twice)
+    saves exactly one answer and the repeats just get the current question
+    back.
+
+    Response time is measured on the server clock only: from when the
+    server handed out this question (current_question_presented_at, or
+    match.started_at for question 0) to now, minus this player's network
+    allowance (network_allowance_seconds).
+    """
+    steps = _SaveSteps()
+    outcome = "ok"
+    try:
+        return await _submit_battle_answer(
+            db, match_id=match_id, user_id=user_id, question_id=question_id, selected_option=selected_option,
+            redis=redis, on_saved=on_saved, steps=steps,
+        )
+    except BaseException as exc:  # incl. CancelledError -- a save cut off by the WS timeout
+        outcome = type(exc).__name__
+        raise
+    finally:
+        steps.log_if_slow(match_id=match_id, user_id=user_id, outcome=outcome)
+
+
+async def _submit_battle_answer(
+    db: AsyncSession, *, match_id: int, user_id: int, question_id: int, selected_option: str | None,
+    redis: Redis | None, on_saved: Callable[[], None] | None, steps: "_SaveSteps",
+) -> AnswerOutcome:
+    steps.start("load match")
+    match = await _get_match_or_404(db, match_id)
+    steps.start("load participants")
+    participants = await _get_participants(db, match_id)
+    me = _require_participant(participants, user_id)  # 403 if not a participant
+
+    steps.start("check match progress")
     match = await _ensure_match_progressed(db, match, redis)
 
     if match.status == "cancelled":
         raise HTTPException(status.HTTP_409_CONFLICT, "This battle was cancelled.")
     if match.status == "completed":
-        raise HTTPException(status.HTTP_409_CONFLICT, "This battle has already ended.")
+        ran_out = match.started_at is not None and datetime.now(UTC) >= answers_close_at(match)
+        raise HTTPException(status.HTTP_409_CONFLICT, TIME_UP_DETAIL if ran_out else "This battle has already ended.")
     if match.status != "active":
         raise HTTPException(status.HTTP_409_CONFLICT, f"Unexpected match status: {match.status}")
 
-    current_order = _current_question_order(match)
-    current_question = await question_payload_for(db, match, current_order)
-    if current_question is None or current_question["question_id"] != question_id:
-        # An earlier question of this same match is just a late answer (e.g. held up by a flaky mobile connection
-        # until the next question had started) -- report it as locked, like any other late answer, rather than as
-        # a bad request. Anything else (a future slot, another match's question) stays a 400.
-        answered_order = (
+    steps.start("reload participant")
+    await db.refresh(me)
+    order = me.current_question_index
+    if order >= settings.BATTLE_QUESTION_COUNT:
+        steps.start("duplicate: reload")
+        return await _duplicate(db, match, me)  # already finished -- a repeat of the last Next/Skip
+
+    steps.start("load question")
+    row = (
+        await db.execute(
+            select(BattleMatchQuestion.question_id, Question)
+            .join(Question, Question.id == BattleMatchQuestion.question_id)
+            .where(BattleMatchQuestion.match_id == match_id, BattleMatchQuestion.question_order == order)
+        )
+    ).first()
+    if row is None or row[0] != question_id:
+        earlier_order = (
             await db.execute(
                 select(BattleMatchQuestion.question_order).where(
                     BattleMatchQuestion.match_id == match_id, BattleMatchQuestion.question_id == question_id
                 )
             )
         ).scalar_one_or_none()
-        if answered_order is not None and answered_order < current_order:
-            raise HTTPException(status.HTTP_409_CONFLICT, "Answers are locked for this question.")
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This is not the current question.")
-    # The pick locks once the reveal phase starts, whether or not the grading
-    # timer has run yet -- otherwise a lagging timer would let a late answer in.
-    if _question_time_remaining_seconds(match, current_order) <= settings.BATTLE_ANSWER_REVEAL_SECONDS:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Answers are locked for this question.")
+        if earlier_order is not None and earlier_order < order:
+            # A repeat for a question already saved (double tap, resend after
+            # a lost reply) -- not an error, just send the current question.
+            steps.start("duplicate: reload")
+            return await _duplicate(db, match, me)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This is not your current question.")
+    question = row[1]
 
-    already_graded = (
-        await db.execute(
-            select(func.count()).select_from(BattleAnswer).where(
-                BattleAnswer.match_id == match_id, BattleAnswer.question_id == question_id,
-                BattleAnswer.user_id == user_id,
-            )
-        )
-    ).scalar() > 0
-    if already_graded:
-        # The reveal boundary already fired for this question (see
-        # _grade_and_reveal_question) -- editing is over. Reusing the
-        # BattleAnswer unique constraint as this signal, same as it was
-        # always the anti-replay guard, just repurposed from "already
-        # answered" to "already locked".
-        raise HTTPException(status.HTTP_409_CONFLICT, "Answers are locked for this question.")
+    # This player's network allowance: both their own 0:00 cutoff and the
+    # speed-bonus timer are adjusted by it (see player_answers_close_at).
+    steps.start("network allowance (Redis)")
+    allowance = await network_allowance_seconds(redis, match_id=match_id, user_id=user_id)
+    closes_at = player_answers_close_at(match, allowance)
+
+    # Lock the match row for the rest of the save: _finalize_match claims the
+    # match with an UPDATE on this same row, so it waits for this save to
+    # commit or roll back -- an answer is either in the final score or
+    # refused, never saved after the result was already worked out.
+    steps.start("lock match")
+    locked_status = (
+        await db.execute(select(BattleMatch.status).where(BattleMatch.id == match_id).with_for_update())
+    ).scalar_one()
+    if locked_status != "active" or datetime.now(UTC) >= closes_at:
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, TIME_UP_DETAIL)
 
     now = datetime.now(UTC)
-    # Fixed per-question window (lockstep play): response time is measured
-    # from when THIS question's window opened, not from the player's own
-    # previous answer -- recomputed fresh on every (re)submission, so
-    # whichever pick is in effect at the lock moment carries its own
-    # correct "time to final answer" for the speed bonus.
-    window_start = as_utc(match.started_at) + timedelta(
-        seconds=current_order * settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
-    )
-    response_time_ms = max(0, int((now - window_start).total_seconds() * 1000))
+    presented_at = as_utc(me.current_question_presented_at or match.started_at)
+    response_time_ms = max(0, int(((now - presented_at).total_seconds() - allowance) * 1000))
 
-    if redis is not None:
-        await _set_pending_answer(
-            redis, match_id=match_id, question_id=question_id, user_id=user_id,
-            selected_option=selected_option, response_time_ms=response_time_ms,
-        )
-
-    return {"question_id": question_id, "selected_option": selected_option}
-
-
-# ── grading + reveal, triggered at the reveal boundary ──────────────────────
-
-async def _grade_one_participant(
-    db: AsyncSession, redis: Redis, *, match_id: int, question: Question, question_id: int,
-    order: int, user_id: int,
-) -> ParticipantQuestionResult:
-    """Grades exactly once per (match, question, user) -- the BattleAnswer
-    unique constraint is the real guard. If this question was already
-    graded (e.g. a second process's progression timer independently reached
-    the same boundary a beat later), read the already-committed row back
-    instead of recomputing -- both processes must reveal the SAME numbers to
-    their own locally-connected sockets.
-    """
-    existing = (
-        await db.execute(
-            select(BattleAnswer).where(
-                BattleAnswer.match_id == match_id, BattleAnswer.question_id == question_id,
-                BattleAnswer.user_id == user_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        return ParticipantQuestionResult(
-            user_id=user_id, answered=bool(existing.selected_option),
-            is_correct=existing.is_correct, base_score=existing.base_score,
-            speed_bonus=existing.speed_bonus, streak_bonus=existing.streak_bonus,
-            total_question_score=existing.total_question_score,
-        )
-
-    pending = await _pop_pending_answer(redis, match_id=match_id, question_id=question_id, user_id=user_id)
-    answered = pending is not None
-    selected_option = pending["selected_option"] if pending is not None else ""
-    response_time_ms = (
-        pending["response_time_ms"] if pending is not None
-        # Never answered at all -- score as 0 regardless (is_correct=False
-        # below short-circuits compute_question_score to all-zero), this is
-        # just a well-defined, non-null value for the NOT NULL column.
-        else int((settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS - settings.BATTLE_ANSWER_REVEAL_SECONDS) * 1000)
-    )
+    answered = selected_option is not None
     is_correct = bool(
         answered and question.correct_answer is not None
         and str(question.correct_answer).strip().lower() == str(selected_option).strip().lower()
     )  # exact grading rule mirrored from quiz_service.submit_quiz()
-
-    streak_before = await _streak_before(
-        db, match_id=match_id, user_id=user_id, before_question_order=order
-    )
+    streak_after = 0
+    if is_correct:
+        steps.start("streak so far")
+        streak_after = await _streak_before(db, match_id=match_id, user_id=user_id, order=order) + 1
     score = compute_question_score(
-        is_correct=is_correct, response_time_seconds=response_time_ms / 1000.0,
-        streak_after_this_answer=streak_before + 1,
+        is_correct=is_correct, response_time_seconds=response_time_ms / 1000.0, streak_after_this_answer=streak_after,
     )
+
+    next_order = order + 1
+    finished = next_order >= settings.BATTLE_QUESTION_COUNT
+    steps.start("advance participant")
+    claimed = (
+        await db.execute(
+            update(BattleParticipant)
+            .where(BattleParticipant.id == me.id, BattleParticipant.current_question_index == order)
+            .values(
+                current_question_index=next_order,
+                current_question_presented_at=now,
+                finished_at=now if finished else None,
+            )
+            .returning(BattleParticipant.id)
+            .execution_options(synchronize_session=False)
+        )
+    ).scalar_one_or_none()
+    if claimed is None:
+        steps.start("duplicate: reload")
+        await db.rollback()  # another request for this same question won
+        return await _duplicate(db, match, me)
     db.add(BattleAnswer(
-        match_id=match_id, question_id=question_id, user_id=user_id, selected_option=selected_option,
+        match_id=match_id, question_id=question_id, user_id=user_id,
+        # "" marks a skip -- the column is NOT NULL, and every reader already
+        # treats a falsy selected_option as "not answered".
+        selected_option=selected_option or "",
         is_correct=score.is_correct, response_time_ms=response_time_ms, base_score=score.base_score,
         speed_bonus=score.speed_bonus, streak_bonus=score.streak_bonus, total_question_score=score.total_score,
     ))
+    if datetime.now(UTC) >= closes_at:
+        # The clock ran out while this was being saved -- refuse it.
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, TIME_UP_DETAIL)
+    steps.start("insert answer + commit")
     try:
         await db.commit()
     except IntegrityError:
-        # Lost a cross-process grading race -- the winner's row is
-        # authoritative, read it back rather than trusting our own
-        # just-computed (possibly stale-pending-answer) numbers.
         await db.rollback()
-        existing = (
-            await db.execute(
-                select(BattleAnswer).where(
-                    BattleAnswer.match_id == match_id, BattleAnswer.question_id == question_id,
-                    BattleAnswer.user_id == user_id,
-                )
-            )
-        ).scalar_one()
-        return ParticipantQuestionResult(
-            user_id=user_id, answered=bool(existing.selected_option),
-            is_correct=existing.is_correct, base_score=existing.base_score,
-            speed_bonus=existing.speed_bonus, streak_bonus=existing.streak_bonus,
-            total_question_score=existing.total_question_score,
-        )
+        return await _duplicate(db, match, me)
+    if on_saved is not None:
+        on_saved()  # the answer is durable -- e.g. lift the WS save timeout
+    steps.start("reload participant (saved)")
+    await db.refresh(me)
 
-    return ParticipantQuestionResult(
-        user_id=user_id, answered=answered, is_correct=score.is_correct, base_score=score.base_score,
-        speed_bonus=score.speed_bonus, streak_bonus=score.streak_bonus, total_question_score=score.total_score,
+    if finished:
+        steps.start("finalize match")
+        match = await _ensure_match_progressed(db, match, redis)  # both done -> finalize now
+    steps.start("load next question")
+    return AnswerOutcome(
+        next=await current_question_for(db, match, me),
+        match=match,
+        progress={"user_id": user_id, "question_order": order, "answered": answered, "answered_count": next_order},
     )
-
-
-async def _grade_and_reveal_question(
-    db: AsyncSession, redis: Redis, *, match: BattleMatch, order: int,
-) -> QuestionResultEvent | None:
-    """Locks, grades, and builds the reveal payload for BOTH participants of
-    question slot `order` -- called from battle_ws.py's progression timer
-    once that question's remaining time drops to
-    BATTLE_ANSWER_REVEAL_SECONDS. Idempotent/race-safe: calling this more
-    than once for the same (match, order) -- e.g. from two processes each
-    running their own progression timer, or a caller re-observing an
-    already-graded question after reconnecting -- always returns the same
-    result, never double-grades. None only if `order` is somehow out of the
-    frozen question set (shouldn't happen in practice).
-    """
-    row = (
-        await db.execute(
-            select(BattleMatchQuestion.question_id, Question)
-            .join(Question, Question.id == BattleMatchQuestion.question_id)
-            .where(BattleMatchQuestion.match_id == match.id, BattleMatchQuestion.question_order == order)
-        )
-    ).first()
-    if row is None:
-        return None
-    question_id, question = row
-
-    participants = await _get_participants(db, match.id)
-    results = [
-        await _grade_one_participant(
-            db, redis, match_id=match.id, question=question, question_id=question_id,
-            order=order, user_id=p.user_id,
-        )
-        for p in participants
-    ]
-    return QuestionResultEvent(question_order=order, results=results, correct_answer=question.correct_answer)
 
 
 # ── stale-match reaper (Phase 6) ──────────────────────────────────────────
@@ -1467,13 +1553,15 @@ async def _force_activate_stalled_ready_matches(db: AsyncSession, redis: Redis, 
 
 async def _settle_finished_unattended_matches(db: AsyncSession, redis: Redis) -> tuple[list[int], list[int]]:
     """Active matches whose time budget (+ buffer) has run out with nobody
-    connected to trigger completion. Grades every slot the progression timer
-    never reached (idempotent -- already-graded slots are read back), then
-    either finalizes normally (someone answered at least one question, so
-    there's a real result to award) or cancels (nobody played at all).
-    Returns (settled_ids, abandoned_ids).
+    connected to trigger completion. Either finalizes normally (someone
+    answered or skipped at least one question, so there's a real result to
+    award) or cancels (nobody played at all). Returns (settled_ids,
+    abandoned_ids).
     """
-    budget = settings.BATTLE_QUESTION_COUNT * settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
+    budget = (
+        settings.BATTLE_MATCH_DURATION_SECONDS + settings.BATTLE_ANSWER_LATE_GRACE_SECONDS
+        + settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS
+    )
     cutoff = datetime.now(UTC) - timedelta(seconds=budget + settings.BATTLE_FINISHED_MATCH_SETTLE_BUFFER_SECONDS)
     matches = (
         await db.execute(select(BattleMatch).where(BattleMatch.status == "active", BattleMatch.started_at < cutoff))
@@ -1482,13 +1570,9 @@ async def _settle_finished_unattended_matches(db: AsyncSession, redis: Redis) ->
     settled: list[int] = []
     abandoned: list[int] = []
     for match in matches:
-        for order in range(settings.BATTLE_QUESTION_COUNT):
-            await _grade_and_reveal_question(db, redis, match=match, order=order)
         anyone_answered = (
             await db.execute(
-                select(func.count()).select_from(BattleAnswer).where(
-                    BattleAnswer.match_id == match.id, BattleAnswer.selected_option != ""
-                )
+                select(func.count()).select_from(BattleAnswer).where(BattleAnswer.match_id == match.id)
             )
         ).scalar_one() > 0
         if anyone_answered:
