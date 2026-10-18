@@ -428,6 +428,19 @@ async def release_match_state(redis: Redis, *, user_id: int) -> None:
 async def _build_matched_response(db: AsyncSession, *, match_id: int, requesting_user_id: int) -> dict:
     match = await db.get(BattleMatch, match_id)
     opponent = None
+    awaiting_opponent = False
+    if match is not None:
+        # This player is done with every question but the opponent is still
+        # playing -- the app shows "Show results" instead of matchmaking.
+        indexes = dict(
+            (
+                await db.execute(
+                    select(BattleParticipant.user_id, BattleParticipant.current_question_index)
+                    .where(BattleParticipant.match_id == match_id)
+                )
+            ).all()
+        )
+        awaiting_opponent = match.status == "active" and indexes.get(requesting_user_id, 0) >= settings.BATTLE_QUESTION_COUNT
     if match is not None:
         row = (
             await db.execute(
@@ -453,6 +466,7 @@ async def _build_matched_response(db: AsyncSession, *, match_id: int, requesting
         "match_id": match_id,
         "difficulty": match.difficulty if match else None,
         "opponent": opponent,
+        "awaiting_opponent": awaiting_opponent,
     }
 
 

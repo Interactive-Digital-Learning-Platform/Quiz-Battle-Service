@@ -8,12 +8,10 @@ tests/test_battle_fair_play.py
   is cancelled.
 - Memorisation: option order is shuffled per match (same for both players),
   and running out of never-seen questions grows the pool.
-- A late answer to an earlier question is "locked", not a bad request.
+- A late answer to an earlier question is a harmless repeat, not an error.
 """
 from datetime import UTC, datetime, timedelta
 
-import pytest
-from fastapi import HTTPException
 from sqlalchemy import select, update
 
 from app.core.config import settings
@@ -22,13 +20,16 @@ from app.models.competitive_rating import CompetitiveSubjectRating
 from app.models.question import Question
 from app.services import battle_gameplay_service, battle_question_service
 from tests.test_battle_gameplay_service import (
-    TOTAL,
+    DURATION,
+    _answer,
     _create_waiting_match,
     _make_user,
     _seed_and_activate,
     _set_started_at,
-    _submit_and_grade,
 )
+
+# The latest anyone's answer can still be accepted (clock + grace + the largest network allowance).
+TOTAL = DURATION + settings.BATTLE_ANSWER_LATE_GRACE_SECONDS + settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Countdown forfeit
@@ -97,9 +98,9 @@ async def test_reaper_settles_a_finished_match_nobody_stayed_for(db_session, fak
         user_a_id=a.id, rating_a=1000, user_b_id=b.id, rating_b=1000,
     )
     _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=a.id, user_b_id=b.id)
-    # A gets the first question right, then both players close the app; the
-    # progression timer never grades the rest.
-    await _submit_and_grade(db_session, fake_redis, match, order=0, user_id=a.id, question_id=questions[0].id, selected_option="A")
+    # A gets the first question right, then both players close the app, so
+    # nothing is left running to end the match when its clock runs out.
+    await _answer(db_session, fake_redis, match, user_id=a.id, question_id=questions[0].id, selected_option="A")
     await fake_redis.hset(f"battle:user_state:{a.id}", "state", "in_match")
     await fake_redis.hset(f"battle:user_state:{b.id}", "state", "in_match")
     await _set_started_at(
@@ -126,7 +127,7 @@ async def test_reaper_leaves_a_match_alone_until_its_time_is_up(db_session, fake
         user_a_id=a.id, rating_a=1000, user_b_id=b.id, rating_b=1000,
     )
     _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=a.id, user_b_id=b.id)
-    await _submit_and_grade(db_session, fake_redis, match, order=0, user_id=a.id, question_id=questions[0].id, selected_option="A")
+    await _answer(db_session, fake_redis, match, user_id=a.id, question_id=questions[0].id, selected_option="A")
     await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL - 5))
 
     assert await battle_gameplay_service.run_stale_match_reap_once(db_session, fake_redis) == 0
@@ -181,7 +182,7 @@ async def test_running_out_of_unseen_questions_grows_the_pool(db_session, monkey
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-async def test_late_answer_to_previous_question_is_locked_not_a_bad_request(db_session, fake_redis):
+async def test_late_answer_to_previous_question_is_a_harmless_repeat(db_session, fake_redis):
     a = await _make_user(db_session, "user-a")
     b = await _make_user(db_session, "user-b")
     match = await _create_waiting_match(
@@ -189,16 +190,11 @@ async def test_late_answer_to_previous_question_is_locked_not_a_bad_request(db_s
         user_a_id=a.id, rating_a=1000, user_b_id=b.id, rating_b=1000,
     )
     _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=a.id, user_b_id=b.id)
-    # Question 1 is now on; an answer for question 0 (held up in transit) arrives.
-    await _set_started_at(
-        db_session, match.id, datetime.now(UTC) - timedelta(seconds=settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS + 1)
-    )
+    await _answer(db_session, fake_redis, match, user_id=a.id, question_id=questions[0].id, selected_option="A")
 
-    with pytest.raises(HTTPException) as exc:
-        await battle_gameplay_service.submit_battle_answer(
-            db_session, match_id=match.id, user_id=a.id, question_id=questions[0].id,
-            selected_option="A", redis=fake_redis,
-        )
+    # The same answer arrives again (resent after a lost reply): no error, no
+    # second row, just the question the player is actually on.
+    again = await _answer(db_session, fake_redis, match, user_id=a.id, question_id=questions[0].id, selected_option="A")
 
-    assert exc.value.status_code == 409
-    assert exc.value.detail == "Answers are locked for this question."
+    assert again.progress is None
+    assert again.next["question_index"] == 1

@@ -28,6 +28,7 @@ from sqlalchemy.pool import StaticPool
 # latter rebinds the local name `app` to the top-level package, clobbering
 # the `from app.main import app` FastAPI instance imported below.
 from app import models as _app_models  # noqa: F401
+from app.core.config import settings
 from app.core.database import Base, get_db
 from app.core.redis_client import get_redis
 from app.core.security import get_current_user
@@ -54,6 +55,17 @@ def _no_real_pool_replenish(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_ai_questions(monkeypatch):
+    # AI-first question generation would make a real Groq call at every
+    # match start; tests use the seeded pool unless they switch it back on
+    # (with generate_questions mocked) -- see test_battle_ai_questions.py.
+    # Its background telemetry write (own AsyncSessionLocal) is neutralized
+    # for the same reason as _no_real_pool_replenish above.
+    monkeypatch.setattr(settings, "BATTLE_AI_FIRST_ENABLED", False)
+    monkeypatch.setattr(battle_question_service, "_kickoff_ai_telemetry", lambda **k: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_matchmaking_sweep_loop(monkeypatch):
     # start_matchmaking_sweep_loop() is only ever started for real in
     # app/main.py's lifespan, which httpx.ASGITransport (used by the
@@ -73,6 +85,15 @@ def _no_real_stale_match_reaper_loop(monkeypatch):
         return None
 
     monkeypatch.setattr(battle_gameplay_service, "start_stale_match_reaper_loop", _noop)
+
+
+@pytest.fixture(autouse=True)
+def _no_rtt_pings(monkeypatch):
+    # The match WebSocket pings every connection to measure round trips (see
+    # battle_ws._ping_loop); left on, those pings would interleave with the
+    # events WS tests read in order. test_ws_pong_records_the_players_round_trip
+    # turns it back on.
+    monkeypatch.setattr(settings, "BATTLE_RTT_FIRST_PING_DELAY_SECONDS", 3600.0)
 
 
 @pytest_asyncio.fixture

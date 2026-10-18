@@ -51,17 +51,20 @@ from app.core.redis_client import get_redis
 from app.core.security import get_current_user_ws
 from app.schemas.battle import BattleMatchStateResponse
 from app.schemas.battle_ws import (
-    AnswerAcknowledgedEvent,
     ConnectedEvent,
     ErrorEvent,
     MatchStartedEvent,
+    NextQuestionEvent,
+    PingEvent,
     PlayerDisconnectedEvent,
+    PlayerProgressEvent,
     PlayerReconnectedEvent,
-    QuestionStartedEvent,
     StateSyncEvent,
     WSAnswerMessage,
     WSForfeitMessage,
+    WSPongMessage,
     WSReadyMessage,
+    WSSkipMessage,
     parse_inbound_message,
 )
 from app.services import battle_gameplay_service, battle_ws_events
@@ -158,6 +161,8 @@ async def _grace_check_task(*, match_id: int, user_id: int, deadline: datetime, 
 
         event: dict | None = None
         async with AsyncSessionLocal() as db:
+            if await battle_gameplay_service.has_finished(db, match_id=match_id, user_id=user_id):
+                return  # finished (e.g. via REST) while away -- nothing to forfeit
             match = await battle_gameplay_service.forfeit_match(
                 db, redis, match_id=match_id, forfeiting_user_id=user_id
             )
@@ -212,6 +217,112 @@ def _make_on_event(*, match_id: int, redis: Redis):
     return _on_event
 
 
+async def _ping_loop(websocket: WebSocket, sent_at: dict[int, float]) -> None:
+    """Pings this socket so its pongs measure the player's round trip (see
+    BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS). Only sends -- the pong is matched
+    up in the connection's receive loop, by nonce, against `sent_at`.
+    Cancelled when the connection ends; it never touches the DB, so that's
+    safe here (unlike the progression timer).
+    """
+    nonce = 0
+    await asyncio.sleep(settings.BATTLE_RTT_FIRST_PING_DELAY_SECONDS)
+    while True:
+        nonce += 1
+        sent_at[nonce] = time.monotonic()
+        # Unanswered pings shouldn't pile up forever.
+        for stale in [n for n in sent_at if n <= nonce - settings.BATTLE_RTT_SAMPLE_COUNT]:
+            sent_at.pop(stale, None)
+        try:
+            await websocket.send_json(PingEvent(nonce=nonce).model_dump(mode="json"))
+        except (RuntimeError, WebSocketDisconnect, OSError):
+            return  # socket already closing -- the receive loop handles the teardown
+        await asyncio.sleep(settings.BATTLE_RTT_PING_INTERVAL_SECONDS)
+
+
+async def _send_answer_outcome(
+    websocket: WebSocket, db, redis: Redis, *, match_id: int, outcome: battle_gameplay_service.AnswerOutcome,
+) -> None:
+    """The answering player's next question goes straight back on their own
+    socket (it's theirs alone); the opponent hears about it via a published
+    player_progress; a match this answer just finished is announced to both.
+    """
+    await websocket.send_json(NextQuestionEvent(**outcome.next).model_dump(mode="json"))
+    if outcome.progress is None:
+        return
+    # The answer is already saved and this player already has their next
+    # question -- a failed announcement must not cost them their connection.
+    # The opponent's next player_progress carries the full answered_count,
+    # and the progression timer announces a finished match on its own next
+    # tick (at most BATTLE_WS_ACTIVE_POLL_INTERVAL_SECONDS later).
+    try:
+        await ws_manager.publish(
+            redis, match_id=match_id, event=PlayerProgressEvent(**outcome.progress).model_dump(mode="json"),
+        )
+        if outcome.match.status == "completed":
+            event = await battle_ws_events.match_finished_event(db, outcome.match)
+            await ws_manager.publish(redis, match_id=match_id, event=event)
+    except Exception:
+        logger.exception("Announcing a saved battle answer failed — match_id=%d", match_id)
+
+
+async def _handle_move(
+    websocket: WebSocket, redis: Redis, *, match_id: int, user_id: int, message: WSAnswerMessage | WSSkipMessage,
+) -> None:
+    """Next/Skip over the WebSocket. Any failure to save -- a DB/Redis error,
+    a dropped or stalled Neon connection (which can surface as a raw
+    OSError/TimeoutError rather than a SQLAlchemyError), or a save slower
+    than BATTLE_ANSWER_SAVE_TIMEOUT_SECONDS -- is reported to the player,
+    never allowed to close their socket: the client keeps the move pending
+    and resends it, and a resend of an answer that did get saved just
+    returns the current question.
+    """
+    saved = False
+
+    def on_saved() -> None:
+        nonlocal saved
+        saved = True
+        save_deadline.reschedule(None)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # Covers the save only: once the answer is committed the deadline
+            # is lifted, so a slow read-back afterwards can't report an answer
+            # that WAS saved as "Couldn't save".
+            async with asyncio.timeout(settings.BATTLE_ANSWER_SAVE_TIMEOUT_SECONDS) as save_deadline:
+                outcome = await battle_gameplay_service.submit_battle_answer(
+                    db, match_id=match_id, user_id=user_id, question_id=message.question_id,
+                    selected_option=message.selected_option if isinstance(message, WSAnswerMessage) else None,
+                    redis=redis, on_saved=on_saved,
+                )
+        except HTTPException as exc:
+            await websocket.send_json(ErrorEvent(detail=str(exc.detail)).model_dump(mode="json"))
+            return
+        except Exception:
+            if saved:
+                # The answer IS saved -- only the work after the commit (e.g.
+                # ending the match) failed. Don't tell the player otherwise:
+                # resync them onto where they really are instead (their next
+                # question, or the result); the progression timer finishes
+                # ending the match on its next tick if that's what failed.
+                logger.exception(
+                    "Battle answer saved but its follow-up failed — match_id=%d, user_id=%d", match_id, user_id
+                )
+                await _send_state_sync(websocket, redis, match_id=match_id, user_id=user_id)
+                return
+            logger.exception("Saving a battle answer failed — match_id=%d, user_id=%d", match_id, user_id)
+            await websocket.send_json(
+                ErrorEvent(detail="Couldn't save your answer — retrying.").model_dump(mode="json")
+            )
+            return
+        await _send_answer_outcome(websocket, db, redis, match_id=match_id, outcome=outcome)
+
+
+async def _send_state_sync(websocket: WebSocket, redis: Redis, *, match_id: int, user_id: int) -> None:
+    async with AsyncSessionLocal() as db:
+        state = await battle_gameplay_service.get_match_state(db, match_id=match_id, user_id=user_id, redis=redis)
+    await websocket.send_json(StateSyncEvent(state=BattleMatchStateResponse(**state)).model_dump(mode="json"))
+
+
 async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> bool:
     """True if stop was requested during the wait, False if the timeout
     elapsed first. Used instead of raw task cancellation for shutting this
@@ -246,15 +357,15 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
     Checking `stop_event` between DB touches means a shutdown request is
     only ever observed at a point where no greenlet switch is in flight.
 
-    Lockstep play: while "active", this loop also pushes one
-    `question_started` event every time `_current_question_order` advances
-    to a new value (including the very first push, right after
-    `match_started` on the countdown->active transition) -- every
-    locally-connected socket gets the SAME question at the SAME instant,
-    since the index is a pure function of already-shared Postgres state
-    (match.started_at). Sleeps until the current question's window closes
-    (or, once the last question's window closes, until
-    _ensure_match_progressed's elapsed-time check can finalize the match).
+    Self-paced play: on the countdown->active transition this loop pushes
+    `match_started` plus question 0 (`next_question`) to every local socket
+    -- everyone starts on question 0 at match.started_at. After that each
+    player's next question is sent by the answer/skip handler, only to them,
+    so all this loop does while "active" is wait (re-checking every
+    BATTLE_WS_ACTIVE_POLL_INTERVAL_SECONDS) for the match clock plus the
+    late-answer grace to run out, when _ensure_match_progressed finalizes
+    it. A match both players finish early is finalized by the last answer
+    itself, which publishes match_finished.
 
     The stop check below is deliberately placed AFTER
     _ensure_match_progressed, not as the `while` loop's own condition: both
@@ -281,16 +392,6 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
     without re-triggering those.
     """
     previous_status: str | None = None
-    previous_question_index: int | None = None
-    # Tracks which question slot's reveal boundary this loop has already
-    # graded -- distinct from previous_question_index (a NEW question
-    # starting) because these are two independent boundaries within the
-    # SAME question's window: question_started fires at the window's open,
-    # this fires BATTLE_ANSWER_REVEAL_SECONDS before it closes. Grading
-    # itself (_grade_and_reveal_question) is idempotent/race-safe, so this
-    # tracker is purely to avoid redundant DB round-trips every tick once a
-    # question is already locked, not a correctness requirement.
-    graded_question_index: int | None = None
     # No top-level try/except here anymore -- an unhandled exception now
     # propagates straight out of this coroutine on purpose, so
     # battle_connection_manager.py's supervisor (which wraps every call to
@@ -337,7 +438,13 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
                 return
 
             if current_status == "active":
-                if previous_status != "active":
+                # Only on a transition this task actually watched happen: a
+                # task that first finds the match already active (a socket
+                # reconnecting mid-match) must not hand everyone question 0
+                # again -- that connection's state_sync carries its own
+                # current question.
+                if previous_status is not None and previous_status != "active":
+                    ends_at = battle_gameplay_service.match_ends_at(match)
                     await ws_manager.push_local(
                         match_id,
                         MatchStartedEvent(
@@ -345,45 +452,23 @@ async def _progression_timer(*, match_id: int, redis: Redis, stop_event: asyncio
                             subject=match.subject,
                             difficulty=match.difficulty,
                             question_count=settings.BATTLE_QUESTION_COUNT,
+                            ends_at=ends_at,
+                            server_time=datetime.now(UTC),
+                        ).model_dump(mode="json"),
+                    )
+                    first_question = await battle_gameplay_service.question_payload_for(db, match, 0)
+                    await ws_manager.push_local(
+                        match_id,
+                        NextQuestionEvent(
+                            question_index=0, question=first_question, finished=False,
+                            ends_at=ends_at, server_time=datetime.now(UTC),
                         ).model_dump(mode="json"),
                     )
 
-                current_index = min(
-                    battle_gameplay_service._current_question_order(match),
-                    settings.BATTLE_QUESTION_COUNT - 1,
+                sleep_seconds = min(
+                    settings.BATTLE_WS_ACTIVE_POLL_INTERVAL_SECONDS,
+                    max(0.05, (battle_gameplay_service.answers_close_at(match) - datetime.now(UTC)).total_seconds()),
                 )
-                if current_index != previous_question_index:
-                    question = await battle_gameplay_service.question_payload_for(db, match, current_index)
-                    if question is not None:
-                        await ws_manager.push_local(
-                            match_id,
-                            QuestionStartedEvent(
-                                question_index=current_index, question=question,
-                                time_remaining_seconds=battle_gameplay_service._question_time_remaining_seconds(
-                                    match, current_index
-                                ),
-                            ).model_dump(mode="json"),
-                        )
-                    previous_question_index = current_index
-
-                remaining = battle_gameplay_service._question_time_remaining_seconds(match, current_index)
-                if (
-                    remaining <= settings.BATTLE_ANSWER_REVEAL_SECONDS
-                    and graded_question_index != current_index
-                ):
-                    result_event = await battle_gameplay_service._grade_and_reveal_question(
-                        db, redis, match=match, order=current_index,
-                    )
-                    if result_event is not None:
-                        await ws_manager.push_local(match_id, result_event.model_dump(mode="json"))
-                    graded_question_index = current_index
-
-                if graded_question_index == current_index:
-                    # Already locked -- nothing more to do until the
-                    # next question's window opens.
-                    sleep_seconds = max(0.05, remaining)
-                else:
-                    sleep_seconds = max(0.05, remaining - settings.BATTLE_ANSWER_REVEAL_SECONDS)
             elif current_status == "countdown":
                 remaining = max(
                     0.0,
@@ -427,6 +512,8 @@ async def battle_match_ws(
             await previous_socket.close(code=status.WS_1000_NORMAL_CLOSURE)
 
     connection_generation = 0
+    ping_sent_at: dict[int, float] = {}
+    ping_task: asyncio.Task | None = None
     try:
         try:
             connection_generation = await battle_gameplay_service.bump_connection_generation(
@@ -485,6 +572,7 @@ async def battle_match_ws(
         # own in-flight Redis/DB work during this window; moving it past
         # that window removed the interleaving entirely.
         asyncio.create_task(_mark_connected_safely(match_id=match_id, user_id=user_id, redis=redis))
+        ping_task = asyncio.create_task(_ping_loop(websocket, ping_sent_at))
 
         recent_messages: deque[float] = deque()
         while True:
@@ -505,43 +593,60 @@ async def battle_match_ws(
                 await websocket.send_json(ErrorEvent(detail=f"Malformed message: {exc}").model_dump(mode="json"))
                 continue
 
-            async with AsyncSessionLocal() as db:
-                if isinstance(message, WSReadyMessage):
+            if isinstance(message, WSPongMessage):
+                sent = ping_sent_at.pop(message.nonce, None)
+                if sent is not None:  # unknown nonce: not a ping of ours, ignore
                     try:
-                        await battle_gameplay_service.mark_ready(db, redis, match_id=match_id, user_id=user_id)
-                    except HTTPException as exc:
-                        # e.g. 404 for a match deleted meanwhile -- report it, don't drop the socket.
-                        await websocket.send_json(ErrorEvent(detail=str(exc.detail)).model_dump(mode="json"))
-                elif isinstance(message, WSAnswerMessage):
-                    try:
-                        result = await battle_gameplay_service.submit_battle_answer(
-                            db, match_id=match_id, user_id=user_id,
-                            question_id=message.question_id, selected_option=message.selected_option,
-                            redis=redis,
+                        await battle_gameplay_service.record_rtt_sample(
+                            redis, match_id=match_id, user_id=user_id, rtt_seconds=time.monotonic() - sent,
                         )
-                        await websocket.send_json(AnswerAcknowledgedEvent(**result).model_dump(mode="json"))
-                    except Exception as exc:  # HTTPException from validation/anti-replay guards
-                        detail = getattr(exc, "detail", str(exc))
-                        await websocket.send_json(ErrorEvent(detail=str(detail)).model_dump(mode="json"))
-                elif isinstance(message, WSForfeitMessage):
-                    try:
+                    except RedisError:
+                        logger.exception("Redis error recording RTT — match_id=%d, user_id=%d", match_id, user_id)
+                continue
+
+            is_move = isinstance(message, (WSAnswerMessage, WSSkipMessage))
+            try:
+                if is_move:
+                    # Inside this try too: closing the save's DB session after
+                    # a timed-out (cancelled) query can itself fail, and that
+                    # must not end the connection either.
+                    await _handle_move(websocket, redis, match_id=match_id, user_id=user_id, message=message)
+                    continue
+                async with AsyncSessionLocal() as db:
+                    if isinstance(message, WSReadyMessage):
+                        await battle_gameplay_service.mark_ready(db, redis, match_id=match_id, user_id=user_id)
+                    elif isinstance(message, WSForfeitMessage):
                         match = await battle_gameplay_service.forfeit_match(
                             db, redis, match_id=match_id, forfeiting_user_id=user_id
                         )
-                    except HTTPException as exc:
-                        await websocket.send_json(ErrorEvent(detail=str(exc.detail)).model_dump(mode="json"))
-                        continue
-                    if match.status == "completed":
-                        event = await battle_ws_events.match_finished_event(db, match)
-                        await ws_manager.publish(redis, match_id=match_id, event=event)
-                    elif match.status == "cancelled":
-                        # Forfeiting a still-"waiting" match (matched but not
-                        # yet both-ready) voids it instead of scoring a win --
-                        # queue.tsx auto-requeues the remaining player off
-                        # this event rather than showing a forfeit-win screen
-                        # for a match that never actually started.
-                        cancel_event = battle_ws_events.match_cancelled_event(match)
-                        await ws_manager.publish(redis, match_id=match_id, event=cancel_event)
+                        if match.status == "completed":
+                            event = await battle_ws_events.match_finished_event(db, match)
+                            await ws_manager.publish(redis, match_id=match_id, event=event)
+                        elif match.status == "cancelled":
+                            # Forfeiting a still-"waiting" match (matched but not
+                            # yet both-ready) voids it instead of scoring a win --
+                            # queue.tsx auto-requeues the remaining player off
+                            # this event rather than showing a forfeit-win screen
+                            # for a match that never actually started.
+                            cancel_event = battle_ws_events.match_cancelled_event(match)
+                            await ws_manager.publish(redis, match_id=match_id, event=cancel_event)
+            except HTTPException as exc:
+                # e.g. 404 for a match deleted meanwhile -- report it, don't drop the socket.
+                await websocket.send_json(ErrorEvent(detail=str(exc.detail)).model_dump(mode="json"))
+            except (WebSocketDisconnect, RuntimeError):
+                raise
+            except Exception:
+                # A DB/Redis failure handling one message must not close the
+                # player's connection (an unhandled error here would end this
+                # handler, tell the opponent they disconnected and start the
+                # forfeit grace countdown). The client can simply retry.
+                logger.exception(
+                    "Handling a battle WS message failed — match_id=%d, user_id=%d, type=%s",
+                    match_id, user_id, type(message).__name__,
+                )
+                # A failed Next/Skip gets the message the client resends on.
+                detail = "Couldn't save your answer — retrying." if is_move else "Something went wrong — please try again."
+                await websocket.send_json(ErrorEvent(detail=detail).model_dump(mode="json"))
     except WebSocketDisconnect:
         pass
     except RuntimeError:
@@ -559,6 +664,8 @@ async def battle_match_ws(
             match_id, user_id,
         )
     finally:
+        if ping_task is not None:
+            ping_task.cancel()
         # The progression timer is owned by the connection manager now (one
         # per match per process, not one per connection) -- disconnect()
         # signals its stop_event only once this is truly the last local
@@ -589,8 +696,13 @@ async def _notify_disconnect(*, match_id: int, user_id: int, redis: Redis, gener
 
     async with AsyncSessionLocal() as db:
         match = await battle_gameplay_service.get_match_row(db, match_id)
-    if match is None or match.status in _TERMINAL_STATUSES:
-        return
+        if match is None or match.status in _TERMINAL_STATUSES:
+            return
+        # A player who has answered or skipped every question may leave (e.g.
+        # back to the home screen to wait for the result) -- not a disconnect:
+        # no notice to the opponent, no grace countdown, no forfeit.
+        if await battle_gameplay_service.has_finished(db, match_id=match_id, user_id=user_id):
+            return
     deadline = await battle_gameplay_service.mark_disconnected(
         redis, match_id=match_id, user_id=user_id, generation=generation
     )

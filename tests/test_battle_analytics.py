@@ -10,7 +10,12 @@ match lifecycle.
 from datetime import UTC, datetime, timedelta
 
 from app.core.config import settings
-from app.models.battle_match import BattleAnswer, BattleMatch, BattleParticipant
+from app.models.battle_match import (
+    BattleAnswer,
+    BattleMatch,
+    BattleMatchQuestion,
+    BattleParticipant,
+)
 from app.models.question import Question
 from app.services import battle_analytics_service
 from app.services.user_service import get_or_create_user
@@ -41,10 +46,13 @@ async def _question(db, *, subject="Mathematics", lesson="Algebra") -> Question:
 async def _match(
     db, *, me_id, opp_id, result="win", subject="Mathematics", status="completed",
     minutes=0, rating_before=1000, rating_after=None, opp_rating_before=1000,
-    final_score=500, answers=(),
+    final_score=500, answers=(), my_index=0, opp_index=0, my_finish_seconds=None, dealt=(),
 ) -> BattleMatch:
     """A finished match. `answers` are (question, is_correct, response_ms,
-    base, speed, streak) tuples recorded for `me`."""
+    base, speed, streak) tuples recorded for `me`; `dealt` are the match's
+    questions (BattleMatchQuestion rows); my_index/opp_index are each
+    player's self-paced progress, my_finish_seconds when `me` got through
+    every question (seconds after the start)."""
     match = BattleMatch(
         subject=subject, status=status, difficulty="easy",
         started_at=T0 + timedelta(minutes=minutes),
@@ -58,14 +66,19 @@ async def _match(
         BattleParticipant(
             match_id=match.id, user_id=me_id, rating_before=rating_before,
             rating_after=rating_after, rating_change=rating_after - rating_before,
-            final_score=final_score, result=result,
+            final_score=final_score, result=result, current_question_index=my_index,
+            finished_at=(
+                T0 + timedelta(minutes=minutes, seconds=my_finish_seconds) if my_finish_seconds is not None else None
+            ),
         ),
         BattleParticipant(
             match_id=match.id, user_id=opp_id, rating_before=opp_rating_before,
             rating_after=opp_rating_before, rating_change=0,
-            final_score=300, result=_OPPOSITE[result],
+            final_score=300, result=_OPPOSITE[result], current_question_index=opp_index,
         ),
     ])
+    for order, q in enumerate(dealt):
+        db.add(BattleMatchQuestion(match_id=match.id, question_id=q.id, question_order=order))
     for q, is_correct, ms, base, speed, streak in answers:
         db.add(BattleAnswer(
             match_id=match.id, question_id=q.id, user_id=me_id, selected_option="a",
@@ -294,3 +307,53 @@ async def test_route_empty_for_brand_new_user(client):
 
     assert resp.status_code == 200
     assert resp.json()["matches_played"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-paced play: question usage and how matches ended
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def test_question_usage_splits_answered_skipped_and_never_reached(db_session):
+    me, other = await _users(db_session)
+    questions = [await _question(db_session) for _ in range(4)]
+    match = await _match(
+        db_session, me_id=me.id, opp_id=other.id, dealt=questions,
+        answers=[(questions[0], True, 3000, 100, 30, 0)],
+    )
+    # questions[1] skipped; questions[2] and [3] never reached.
+    db_session.add(BattleAnswer(
+        match_id=match.id, question_id=questions[1].id, user_id=me.id, selected_option="",
+        is_correct=False, response_time_ms=2000, base_score=0, speed_bonus=0,
+        streak_bonus=0, total_question_score=0,
+    ))
+    await db_session.commit()
+
+    data = await battle_analytics_service.get_battle_analytics(db_session, user_id=me.id)
+
+    assert data["question_usage"] == {"questions": 4, "answered": 1, "skipped": 1, "not_reached": 2}
+
+
+async def test_match_endings_and_average_finish_time(db_session):
+    me, other = await _users(db_session)
+    n = settings.BATTLE_QUESTION_COUNT
+    await _match(db_session, me_id=me.id, opp_id=other.id, minutes=0, my_index=n, opp_index=n, my_finish_seconds=120)
+    await _match(db_session, me_id=me.id, opp_id=other.id, minutes=10, my_index=n, opp_index=6, my_finish_seconds=180)
+    await _match(db_session, me_id=me.id, opp_id=other.id, minutes=20, my_index=7, opp_index=n)
+    await _match(db_session, me_id=me.id, opp_id=other.id, minutes=30, result="forfeit", my_index=3)
+    # Before self-paced play: no progress recorded -- not counted as any ending.
+    await _match(db_session, me_id=me.id, opp_id=other.id, minutes=40)
+
+    data = await battle_analytics_service.get_battle_analytics(db_session, user_id=me.id)
+
+    assert data["match_endings"] == {
+        "all_finished": 1, "time_up": 2, "forfeit": 1,
+        "finished_all_questions": 2, "average_finish_seconds": 150.0,
+    }
+
+
+async def test_empty_user_has_zeroed_usage_and_endings(db_session):
+    me, _ = await _users(db_session)
+    data = await battle_analytics_service.get_battle_analytics(db_session, user_id=me.id)
+
+    assert data["question_usage"] == {"questions": 0, "answered": 0, "skipped": 0, "not_reached": 0}
+    assert data["match_endings"]["average_finish_seconds"] is None

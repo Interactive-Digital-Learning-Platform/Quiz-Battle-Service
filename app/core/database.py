@@ -16,14 +16,14 @@ database_url_obj = make_url(database_url)
 
 engine_kwargs: dict[str, object] = {
     "future": True,
-    "echo": (settings.ENVIRONMENT == "development"),
+    "echo": settings.DB_ECHO,
     "pool_pre_ping": True,
 }
 
 if database_url_obj.drivername.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
-    engine_kwargs["connect_args"] = {"ssl": True}
+    engine_kwargs["connect_args"] = {"ssl": True, "command_timeout": settings.DB_COMMAND_TIMEOUT_SECONDS}
     engine_kwargs["pool_size"] = settings.DB_POOL_SIZE
     engine_kwargs["max_overflow"] = settings.DB_MAX_OVERFLOW
 

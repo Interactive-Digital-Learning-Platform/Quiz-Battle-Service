@@ -38,6 +38,7 @@ async def match_finished_event(db: AsyncSession, match: BattleMatch) -> dict:
     )
     return MatchFinishedEvent(
         winner_user_id=match.winner_user_id,
+        end_reason=await battle_gameplay_service.match_end_reason(db, match.id),
         participants=[
             battle_gameplay_service.participant_result_payload(p, username=usernames_by_id.get(p.user_id))
             for p in participants

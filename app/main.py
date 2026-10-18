@@ -12,8 +12,13 @@ from app.api.routes import battle, battle_ws
 from app.core import log_redaction
 from app.core.config import settings
 from app.core.database import Base, engine
+from app.core.loop_watchdog import run_loop_watchdog
 from app.core.redis_client import redis_client
-from app.services import battle_gameplay_service, matchmaking_service
+from app.services import (
+    battle_gameplay_service,
+    battle_question_service,
+    matchmaking_service,
+)
 
 logging.basicConfig(
     level=logging.DEBUG if settings.ENVIRONMENT == "development" else logging.INFO,
@@ -50,6 +55,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # matchmaking_service.run_in_match_reconcile_once).
     await matchmaking_service.clear_all_queue_state(redis_client)
 
+    if settings.LOOP_WATCHDOG_ENABLED:
+        _app.state.loop_watchdog_task = asyncio.create_task(run_loop_watchdog())
     _app.state.matchmaking_sweep_task = asyncio.create_task(
         matchmaking_service.start_matchmaking_sweep_loop()
     )
@@ -59,12 +66,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _app.state.in_match_reconciler_task = asyncio.create_task(
         matchmaking_service.start_in_match_reconciler_loop()
     )
+    if settings.BATTLE_POOL_WARMUP_ON_STARTUP:
+        _app.state.pool_warmup_task = asyncio.create_task(battle_question_service.warm_up_pools())
 
     yield
 
     logger.info("Shutting down — disposing DB engine...")
 
-    for task_attr in ("matchmaking_sweep_task", "stale_match_reaper_task", "in_match_reconciler_task"):
+    for task_attr in (
+        "matchmaking_sweep_task", "stale_match_reaper_task", "in_match_reconciler_task", "pool_warmup_task",
+        "loop_watchdog_task",
+    ):
         task = getattr(_app.state, task_attr, None)
         if task is not None:
             task.cancel()

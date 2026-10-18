@@ -119,13 +119,18 @@ class BattleParticipant(Base):
     # "win" | "loss" | "draw" | "forfeit" once populated -- plain string, no enum.
     result: Mapped[str | None] = mapped_column(String(10), nullable=True, default=None)
 
-    # Unused -- a leftover from a self-paced play experiment that was
-    # reverted back to lockstep timing (both players on the same question at
-    # the same time, match completion driven purely by
-    # BattleMatch.started_at + elapsed time, see
-    # battle_gameplay_service._ensure_match_progressed). Always NULL. Left
-    # in place rather than migrated away to avoid another live-DB schema
-    # change; safe to ignore.
+    # Self-paced play: the question this player is on (0-based), equal to
+    # BATTLE_QUESTION_COUNT once they've answered or skipped every question.
+    # Only ever advanced by battle_gameplay_service.submit_battle_answer's
+    # compare-and-swap, in the same transaction that saves the answer.
+    current_question_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # When the server handed this player their current question -- the start
+    # of the hidden per-question timer behind the speed bonus. NULL for
+    # question 0, which starts at BattleMatch.started_at.
+    current_question_presented_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    # When this player answered or skipped their last question (NULL until then).
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(
@@ -139,11 +144,9 @@ class BattleParticipant(Base):
 class BattleMatchQuestion(Base):
     """The frozen, ordered question set for one match -- both players see the
     SAME sequence, selected once at match activation
-    (battle_question_service.select_battle_questions). Lockstep play: the
-    live "current" question for both players is derived purely from elapsed
-    wall-clock time since BattleMatch.started_at (see
-    battle_gameplay_service._current_question_order), question_order *is*
-    that derivation key, not just display ordering.
+    (battle_question_service.select_battle_questions). Each player works
+    through it at their own pace: BattleParticipant.current_question_index
+    points at a question_order here.
     """
 
     __tablename__ = "battle_match_questions"

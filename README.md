@@ -97,15 +97,26 @@ per event name (`app/schemas/battle_ws.py`) — both inbound client messages
 and outbound server events are validated against these, never sent/parsed as
 ad-hoc dicts.
 
+Gameplay is self-paced: both players get the same 10 questions in the same
+order and move on with Next (`answer`) or `skip` at their own pace; the whole
+match runs on one 5-minute clock (`BATTLE_MATCH_DURATION_SECONDS`) and ends
+early once both have finished. Each answer is saved before the player's next
+question is sent; correct = 100 points plus a speed bonus (≤5s +30, ≤10s
++20, ≤15s +10) timed on the server clock from when that question was handed
+out, minus a capped network allowance measured with `ping`/`pong`. Highest
+score wins. Right/wrong is only revealed in the end-of-match review
+(`review` on `GET .../state` once completed).
+
 Inbound (client → server): `ready`, `answer` (`question_id`, `selected_option`),
-`forfeit`.
+`skip` (`question_id`), `pong` (`nonce`), `forfeit`.
 
 Outbound (server → client): `connected`, `state_sync` (full match state, sent
 on every connect/reconnect), `player_ready`, `countdown_started`,
-`match_started`, `question_started`, `answer_acknowledged` (direct response
-to the answering client only), `opponent_answered` (broadcast to every
-locally-connected socket for the match, including the answering player's
-own — never includes `selected_option`/`is_correct`), `player_disconnected`,
+`match_started` (with `ends_at`/`server_time` for the match clock),
+`next_question` (to that player only — question 0 at the start, then after
+each saved answer/skip; a repeated Next/Skip just gets it again),
+`player_progress` (broadcast after each saved answer/skip — how far a player
+is, never whether they were right), `ping`, `player_disconnected`,
 `player_reconnected`, `match_finished`, `match_cancelled`, `error`. There is
 no separate `queue_joined`/`opponent_found`/`score_updated` event — those are
 REST response fields instead (`POST /queue/join`, `GET /queue/status`).

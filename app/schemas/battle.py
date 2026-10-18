@@ -94,6 +94,9 @@ class QueueStatusResponse(BaseModel):
     match_id: int | None = None
     difficulty: str | None = None
     opponent: OpponentPublicInfo | None = None
+    # "matched" only: this player has finished every question and is waiting
+    # for the opponent to finish (or the match clock to run out).
+    awaiting_opponent: bool = False
 
 
 class BattleQuestionPublic(BaseModel):
@@ -131,38 +134,37 @@ class BattleParticipantResult(BaseModel):
 
 class BattleMatchResult(BaseModel):
     winner_user_id: int | None
+    # "forfeit" | "all_finished" | "time_up" -- see
+    # battle_gameplay_service.match_end_reason.
+    end_reason: str | None = None
     me: BattleParticipantResult
     opponent: BattleParticipantResult | None
 
 
 class BattleAnswerProgress(BaseModel):
-    # One question slot's outcome for a participant's progress bar -- drives
-    # BOTH players' bars (own answers AND, live over WS via the
-    # question_result event / on load via this same shape, the opponent's).
-    # Every GRADED question slot gets an entry now (deferred-grading design
-    # -- see battle_gameplay_service._grade_one_participant), including ones
-    # this participant never actually submitted anything for -- `answered`
-    # is what distinguishes "answered wrong" (is_correct=False, answered=True)
-    # from "never answered at all" (is_correct=False, answered=False) for the
-    # progress bar's yellow-vs-red segment coloring. Absence of an entry
-    # entirely just means this question slot hasn't been graded/reached yet.
+    # One question a participant has moved past, for the progress bars --
+    # `answered` is False for a skipped question. Correctness is never
+    # included while the match is live (no right/wrong feedback until the
+    # end), so is_correct is always None here.
     question_order: int
-    is_correct: bool
+    is_correct: bool | None = None
     answered: bool
 
 
-class ParticipantQuestionResult(BaseModel):
-    # One participant's graded outcome for one question, revealed to BOTH
-    # players simultaneously at the reveal boundary -- see
-    # battle_gameplay_service._grade_and_reveal_question. Deliberately never
-    # includes selected_option -- preserves the existing "never leak the
-    # specific answer to the opponent" rule; only correctness is shared.
-    user_id: int
-    answered: bool
-    is_correct: bool
+class BattleQuestionReview(BaseModel):
+    # One row of the end-of-match review -- the viewer's OWN answers only.
+    # status: "correct" | "incorrect" | "skipped" | "unanswered" (never
+    # reached before the match clock ran out).
+    question_order: int
+    question: str
+    options: list[Any] | None = None
+    correct_answer: str | None
+    selected_option: str | None
+    status: str
+    response_time_ms: int | None
     base_score: int
     speed_bonus: int
-    streak_bonus: int
+    streak_bonus: int = 0
     total_question_score: int
 
 
@@ -175,37 +177,33 @@ class BattleMatchStateResponse(BaseModel):
     subject: str | None = None
     difficulty: str | None = None
     question_count: int | None = None
-    # Seconds remaining in the CURRENT question's fixed window (lockstep
-    # play -- see battle_gameplay_service._question_time_remaining_seconds).
+    # Seconds left on the whole-match clock.
     time_remaining_seconds: float | None = None
     countdown_seconds_remaining: float | None = None
-    # The single live question both players are currently on, derived from
-    # elapsed time (see battle_gameplay_service._current_question_order).
+    # The viewer's OWN current question (self-paced play -- the opponent may
+    # be on a different one). question_index == question_count with
+    # question=None and finished=True once they've moved past every question.
     question_index: int | None = None
     question: BattleQuestionPublic | None = None
-    has_answered_current_question: bool | None = None
-    # Every question slot answered so far by each side, for progress-bar
-    # hydration on initial load/reconnect (kept live afterward via the
-    # question_result WS event once each question locks).
+    finished: bool | None = None
+    # When the match clock runs out, plus the server's clock at the moment
+    # this was built -- clients count down to ends_at using their offset
+    # from server_time rather than trusting their own clock.
+    ends_at: datetime | None = None
+    server_time: datetime | None = None
+    # Every question each side has moved past so far, for progress-bar
+    # hydration on load/reconnect (kept live afterward via the
+    # player_progress WS event).
     my_answers: list[BattleAnswerProgress] | None = None
     opponent_answers: list[BattleAnswerProgress] | None = None
-    # Populated only once the CURRENT question has locked/been graded (see
-    # battle_gameplay_service._grade_and_reveal_question) -- None means it's
-    # still answerable. Lets a reconnecting client immediately show the
-    # locked/revealed state instead of a live answering UI for a question
-    # that already finished grading while it was disconnected.
-    current_question_results: list[ParticipantQuestionResult] | None = None
-    # Paired with current_question_results -- populated under the same
-    # condition (question already locked/graded), None while still
-    # answerable. See BattleQuestionPublic for why `question` itself never
-    # carries this.
-    current_question_correct_answer: str | None = None
     my_progress: BattleParticipantProgress | None = None
     opponent_progress: BattleParticipantProgress | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     reason: str | None = None
     result: BattleMatchResult | None = None
+    # "completed" only: the viewer's own per-question review.
+    review: list[BattleQuestionReview] | None = None
 
 
 class BattleHistoryEntry(BaseModel):
@@ -231,20 +229,24 @@ class BattleHistoryResponse(BaseModel):
 
 class SubmitBattleAnswerRequest(BaseModel):
     question_id: int
-    # 512 = battle_answers.selected_option's length. Longer picks used to be accepted into Redis and only fail at
-    # grading time, breaking the reveal for both players.
+    # 512 = battle_answers.selected_option's length.
     selected_option: str = Field(..., min_length=1, max_length=512)
 
 
-class SubmitBattleAnswerResponse(BaseModel):
-    # Deliberately minimal -- grading is deferred to the reveal boundary
-    # (see battle_gameplay_service._grade_and_reveal_question /
-    # QuestionResultEvent below), so submitting an answer no longer reveals
-    # correctness. This is just an ack that the (re)submission was accepted;
-    # question_id lets the client correlate it since answers can be changed
-    # freely (resubmitted) any number of times before the question locks.
+class SkipBattleQuestionRequest(BaseModel):
     question_id: int
-    selected_option: str
+
+
+class BattleNextQuestionResponse(BaseModel):
+    # Returned once an answer/skip is saved (or re-sent unchanged for a
+    # duplicate Next/Skip): the player's next question, or finished=True with
+    # question=None once they've moved past the last one. Never says whether
+    # the answer was right -- that waits for the end-of-match review.
+    question_index: int
+    question: BattleQuestionPublic | None
+    finished: bool
+    ends_at: datetime
+    server_time: datetime
 
 
 # ── GET /battle/analytics ────────────────────────────────────────────────────
@@ -293,6 +295,26 @@ class BattleStrongerOpponents(BaseModel):
     wins: int
 
 
+class BattleQuestionUsage(BaseModel):
+    # Every question dealt to the user in completed matches, by what happened to it.
+    questions: int
+    answered: int
+    skipped: int
+    not_reached: int  # the clock ran out (or someone forfeited) before they got to it
+
+
+class BattleMatchEndings(BaseModel):
+    # How the user's matches ended (see battle_gameplay_service.match_end_reason);
+    # matches from before self-paced play aren't counted.
+    all_finished: int
+    time_up: int
+    forfeit: int
+    # Matches where the user got through every question, and their average
+    # time to do so (None if they never have).
+    finished_all_questions: int
+    average_finish_seconds: float | None
+
+
 class BattleAnalyticsResponse(BaseModel):
     matches_played: int
     wins: int
@@ -313,3 +335,5 @@ class BattleAnalyticsResponse(BaseModel):
     # Lessons with at least BATTLE_ANALYTICS_TOPIC_MIN_ANSWERS answers, strongest first.
     topics: list[BattleTopicStat]
     vs_stronger: BattleStrongerOpponents
+    question_usage: BattleQuestionUsage
+    match_endings: BattleMatchEndings

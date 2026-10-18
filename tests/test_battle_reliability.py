@@ -3,7 +3,8 @@ tests/test_battle_reliability.py
 ────────────────────────────────
 Regression tests for the reliability fixes:
 
-- answers lock at the reveal boundary even if the grading timer hasn't run;
+- answers close once the match clock (plus its late-answer grace) has run
+  out, even if nothing has ended the match yet;
 - queue join rate-limits before writing anything; cancel reports Redis outages as 503;
 - optional `azp` (authorized party) check on Clerk tokens;
 - WebSocket: ready/forfeit errors are reported instead of dropping the socket,
@@ -29,14 +30,12 @@ from tests.test_battle_gameplay_service import (
 )
 from tests.test_battle_ws_routes import CLERK_A, ws_env  # noqa: F401  (fixture)
 
-Q = settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Late answers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-async def test_answer_in_reveal_window_is_locked_before_grading_runs(db_session, fake_redis):
+async def test_answer_after_the_clock_and_grace_is_rejected_before_anything_ended_the_match(db_session, fake_redis):
     user_a = await _make_user(db_session, "user-a")
     user_b = await _make_user(db_session, "user-b")
     match = await _create_waiting_match(
@@ -45,9 +44,13 @@ async def test_answer_in_reveal_window_is_locked_before_grading_runs(db_session,
     )
     _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
 
-    # One second into the reveal phase of question 0; nothing has been graded yet.
+    # One second past the late-answer grace; the match is still "active" in the DB.
     await _set_started_at(
-        db_session, match.id, datetime.now(UTC) - timedelta(seconds=Q - settings.BATTLE_ANSWER_REVEAL_SECONDS + 1)
+        db_session, match.id,
+        datetime.now(UTC) - timedelta(
+            seconds=settings.BATTLE_MATCH_DURATION_SECONDS + settings.BATTLE_ANSWER_LATE_GRACE_SECONDS
+            + settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS + 1
+        ),
     )
     with pytest.raises(HTTPException) as exc:
         await battle_gameplay_service.submit_battle_answer(
@@ -56,7 +59,7 @@ async def test_answer_in_reveal_window_is_locked_before_grading_runs(db_session,
         )
 
     assert exc.value.status_code == 409
-    assert await fake_redis.keys("*pending*") == []
+    assert exc.value.detail == battle_gameplay_service.TIME_UP_DETAIL
 
 
 # ─────────────────────────────────────────────────────────────────────────────

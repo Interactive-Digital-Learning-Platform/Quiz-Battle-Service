@@ -65,6 +65,8 @@ sys.path.insert(0, str(REPO_ROOT))
 _TMP_DB_PATH = Path(f"/tmp/battle_verify_{uuid.uuid4().hex}.db")
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TMP_DB_PATH}"
 os.environ["REDIS_URL"] = os.environ.get("BATTLE_VERIFY_REDIS_URL", "redis://localhost:6379/15")
+# No real Groq calls: matches use the pool this script seeds itself.
+os.environ["BATTLE_AI_FIRST_ENABLED"] = "false"
 
 import httpx
 import uvicorn
@@ -273,41 +275,37 @@ async def run_full_flow(client: httpx.AsyncClient) -> None:
         check("match_started received on A (not duplicated -- see module docstring)", match_started_a is not None)
         check("match_started received on B (not duplicated -- see module docstring)", match_started_b is not None)
 
-        # Lockstep battles push the single current question right after
-        # match_started -- both players receive the SAME question_index/
-        # question at the same instant.
-        question_started_a = await _drain_until(ws_a, "question_started", timeout=5)
-        question_started_b = await _drain_until(ws_b, "question_started", timeout=5)
-        check("A receives question_started for question 0", question_started_a is not None)
-        check("B receives question_started for question 0", question_started_b is not None)
+        # Everyone gets question 0 right after match_started; after that each
+        # player moves on at their own pace with Next/Skip.
+        first_question_a = await _drain_until(ws_a, "next_question", timeout=5)
+        first_question_b = await _drain_until(ws_b, "next_question", timeout=5)
+        check("A receives next_question for question 0", first_question_a is not None)
+        check("B receives next_question for question 0", first_question_b is not None)
         check(
-            "question_started payload never includes correct_answer",
-            "correct_answer" not in json.dumps(question_started_a or {}),
+            "next_question payload never includes correct_answer",
+            "correct_answer" not in json.dumps(first_question_a or {}),
         )
 
-        question_id = (question_started_a or {}).get("question", {}).get("question_id")
+        question_id = (first_question_a or {}).get("question", {}).get("question_id")
         check("question_id extracted", question_id is not None)
 
-        # Grading/reveal is deferred to the reveal boundary (last
-        # BATTLE_ANSWER_REVEAL_SECONDS of the question's window, see
-        # battle_gameplay_service._grade_and_reveal_question) -- submitting
-        # (over REST or WS) is just an ack now, never correctness, and
-        # there's no more immediate opponent_answered push. Waiting out a
-        # real ~25s to observe question_result isn't done here (this script
-        # forfeits shortly after instead, see below); that flow is covered
-        # by tests/test_battle_ws_routes.py's editable-answer tests instead.
+        # Next over REST: the response is A's next question, handed out only
+        # once the answer is saved -- never whether it was right.
         r = await client.post(
             f"{BASE_URL}/api/v1/battle/match/{match_id}/answer",
             json={"question_id": question_id, "selected_option": "A"},
             headers={"Authorization": f"Bearer {CLERK_A}"},
         )
         check("A answers question 0 over REST (200)", r.status_code == 200)
+        check("REST answer moves A to question 1", r.status_code == 200 and r.json().get("question_index") == 1)
         check("REST answer response never includes correct_answer", "correct_answer" not in r.text)
+        progress_b = await _drain_until(ws_b, "player_progress", timeout=5)
+        check("B sees A's progress over WS", progress_b is not None and progress_b.get("answered_count") == 1)
 
-        await ws_b.send(json.dumps({"type": "answer", "question_id": question_id, "selected_option": "A"}))
-        ack_b = await _drain_until(ws_b, "answer_acknowledged", timeout=5)
-        check("B receives answer_acknowledged over WS", ack_b is not None)
-        check("WS answer ack never includes correct_answer", ack_b is not None and "correct_answer" not in json.dumps(ack_b))
+        # Skip over WS.
+        await ws_b.send(json.dumps({"type": "skip", "question_id": question_id}))
+        next_b = await _drain_until(ws_b, "next_question", timeout=5)
+        check("B's skip moves B to question 1 over WS", next_b is not None and next_b.get("question_index") == 1)
 
         # Forfeit A over REST rather than waiting out all remaining
         # questions in real time -- deliberately exercises the REST+WS
@@ -347,63 +345,161 @@ async def run_full_flow(client: httpx.AsyncClient) -> None:
     check("A is not stuck 'in_match' after forfeit (queue/cancel is a clean 200 no-op)", r.status_code == 200)
 
 
-async def run_question_boundary_flow(client: httpx.AsyncClient) -> None:
-    print("\n== Lockstep question boundary: both players advance to question 1 together ==")
-    clerk_a3, clerk_b3 = f"{CLERK_A}-3", f"{CLERK_B}-3"
+# Pause between one player's moves in the fast-play flows. Well under any
+# human's pace (a real player can't read and answer a question in 0.3s), but
+# keeps a bot under the per-socket message throttle
+# (BATTLE_WS_MESSAGE_RATE_LIMIT_MAX_CALLS per ..._WINDOW_SECONDS).
+_FAST_MOVE_PAUSE_SECONDS = 0.3
+
+
+async def _start_match(client: httpx.AsyncClient, clerk_a: str, clerk_b: str, subject: str, match_id: int | None):
+    """(Queue -> match, unless already matched) -> both connect + ready ->
+    both on question 0. Returns (match_id, ws_a, ws_b, first_a, first_b) with
+    the sockets still open, or None if any step failed (already reported)."""
+    if match_id is None:
+        match_id = await _join_and_match(client, clerk_a, clerk_b, subject)
+    if match_id is None:
+        return None
+    ws_a = await websockets.connect(f"{WS_BASE}/api/v1/battle/match/{match_id}/ws?token={clerk_a}")
+    ws_b = await websockets.connect(f"{WS_BASE}/api/v1/battle/match/{match_id}/ws?token={clerk_b}")
+    for ws in (ws_a, ws_b):
+        await _recv_json(ws)  # connected
+        await _recv_json(ws)  # state_sync
+    await ws_a.send(json.dumps({"type": "ready"}))
+    await ws_b.send(json.dumps({"type": "ready"}))
+    first_a = await _drain_until(ws_a, "next_question", timeout=settings.BATTLE_COUNTDOWN_DURATION_SECONDS + 10)
+    first_b = await _drain_until(ws_b, "next_question", timeout=settings.BATTLE_COUNTDOWN_DURATION_SECONDS + 10)
+    return match_id, ws_a, ws_b, first_a, first_b
+
+
+async def _play_fast(ws, first: dict, *, skip: bool) -> dict:
+    """Answers ("A", always correct in the seeded pool) or skips every
+    question as fast as allowed, then waits for match_finished. Records
+    each save's round trip and every event that arrived along the way."""
+    result = {"latencies": [], "indexes": [], "errors": [], "progress": [], "finished": [], "unexpected": []}
+    current = first
+    while current is not None and not current.get("finished"):
+        question_id = current["question"]["question_id"]
+        move = {"type": "skip", "question_id": question_id} if skip else {
+            "type": "answer", "question_id": question_id, "selected_option": "A",
+        }
+        sent = time.monotonic()
+        await ws.send(json.dumps(move))
+        current = None
+        while current is None:
+            try:
+                msg = await asyncio.wait_for(_recv_json(ws), timeout=10)
+            except TimeoutError:
+                result["errors"].append("no reply within 10s")
+                return result
+            kind = msg.get("type")
+            if kind == "next_question":
+                result["latencies"].append(time.monotonic() - sent)
+                result["indexes"].append(msg["question_index"])
+                current = msg
+            elif kind == "error":
+                result["errors"].append(msg.get("detail"))
+                return result
+            elif kind == "player_progress":
+                result["progress"].append(msg)
+            elif kind == "match_finished":
+                result["finished"].append(msg)
+            elif kind != "pong" and kind != "ping":
+                result["unexpected"].append(kind)
+        await asyncio.sleep(_FAST_MOVE_PAUSE_SECONDS)
+    # Done -- collect everything else until the match ends (and a beat
+    # longer, to catch a duplicate match_finished).
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            msg = await asyncio.wait_for(_recv_json(ws), timeout=1.0 if result["finished"] else deadline - time.monotonic())
+        except (TimeoutError, websockets.ConnectionClosed):
+            if result["finished"]:
+                break
+            continue
+        kind = msg.get("type")
+        if kind == "player_progress":
+            result["progress"].append(msg)
+        elif kind == "match_finished":
+            result["finished"].append(msg)
+        elif kind == "error":
+            result["errors"].append(msg.get("detail"))
+    return result
+
+
+def _progress_counts(result: dict, user_id: int) -> list[int]:
+    return [p["answered_count"] for p in result["progress"] if p["user_id"] == user_id]
+
+
+async def _run_fast_match(
+    client: httpx.AsyncClient, clerk_a: str, clerk_b: str, subject: str, label: str, match_id: int | None = None,
+) -> list[float]:
+    started = await _start_match(client, clerk_a, clerk_b, subject, match_id)
+    if started is None:
+        check(f"{label}: match started", False)
+        return []
+    match_id, ws_a, ws_b, first_a, first_b = started
+    try:
+        check(f"{label}: both players get question 0", first_a is not None and first_b is not None)
+        if first_a is None or first_b is None:
+            return []
+        res_a, res_b = await asyncio.gather(_play_fast(ws_a, first_a, skip=False), _play_fast(ws_b, first_b, skip=True))
+    finally:
+        await ws_a.close()
+        await ws_b.close()
+
+    n = settings.BATTLE_QUESTION_COUNT
+    check(f"{label}: no errors (A={res_a['errors']}, B={res_b['errors']})", not res_a["errors"] and not res_b["errors"])
+    check(f"{label}: A moved through every question in order", res_a["indexes"] == list(range(1, n + 1)))
+    check(f"{label}: B moved through every question in order", res_b["indexes"] == list(range(1, n + 1)))
+    finished = (res_a["finished"] or [None])[0] or {}
+    participants = {p["user_id"]: p for p in finished.get("participants", [])}
+    ids = list(participants)
+    user_a = next((uid for uid, p in participants.items() if (p.get("correct_count") or 0) > 0), None)
+    user_b = next((uid for uid in ids if uid != user_a), None)
+    # Every one of the opponent's moves reached each player, once, in order.
+    check(f"{label}: A saw all of B's progress, once each", user_b is not None and _progress_counts(res_a, user_b) == list(range(1, n + 1)))
+    check(f"{label}: B saw all of A's progress, once each", user_a is not None and _progress_counts(res_b, user_a) == list(range(1, n + 1)))
+    check(f"{label}: match_finished reached each player exactly once", len(res_a["finished"]) == 1 and len(res_b["finished"]) == 1)
+    check(f"{label}: both players saw the same result", res_a["finished"][:1] == res_b["finished"][:1])
+    check(f"{label}: A (all correct) beat B (all skipped)", finished.get("winner_user_id") == user_a and user_a is not None)
+    if user_a is not None:
+        check(f"{label}: A is credited {n} correct answers", participants[user_a].get("correct_count") == n)
+
+    # Free to queue again straight away (in_match released at completion).
+    r = await client.post(f"{BASE_URL}/api/v1/battle/queue/cancel", headers={"Authorization": f"Bearer {clerk_a}"})
+    check(f"{label}: A isn't left stuck 'in_match'", r.status_code == 200)
+    return res_a["latencies"] + res_b["latencies"]
+
+
+def _report_latencies(label: str, latencies: list[float]) -> None:
+    if not latencies:
+        return
+    ordered = sorted(latencies)
+    p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+    print(f"  ..    {label}: {len(ordered)} saves — median {ordered[len(ordered) // 2] * 1000:.0f}ms, "
+          f"p95 {p95 * 1000:.0f}ms, max {ordered[-1] * 1000:.0f}ms")
+
+
+async def run_fast_play_flow(client: httpx.AsyncClient) -> None:
+    print("\n== Fast play: both players race through every question (A answers, B skips) ==")
     await _seed_question_pool("Science", "easy", count=20)
     await _seed_question_pool("Science", "medium", count=20)
+    latencies = await _run_fast_match(client, f"{CLERK_A}-fast", f"{CLERK_B}-fast", "Science", "fast match")
+    _report_latencies("save round trips", latencies)
 
-    match_id = await _join_and_match(client, clerk_a3, clerk_b3, "Science")
-    check("match_id present", match_id is not None)
-    if match_id is None:
-        return
 
-    url_a = f"{WS_BASE}/api/v1/battle/match/{match_id}/ws?token={clerk_a3}"
-    url_b = f"{WS_BASE}/api/v1/battle/match/{match_id}/ws?token={clerk_b3}"
-
-    async with websockets.connect(url_a) as ws_a, websockets.connect(url_b) as ws_b:
-        await _recv_json(ws_a)  # connected
-        await _recv_json(ws_a)  # state_sync
-        await _recv_json(ws_b)  # connected
-        await _recv_json(ws_b)  # state_sync
-
-        await ws_a.send(json.dumps({"type": "ready"}))
-        await ws_b.send(json.dumps({"type": "ready"}))
-
-        await _drain_until(ws_a, "countdown_started")
-        await _drain_until(ws_b, "countdown_started")
-        match_started_a = await _drain_until(ws_a, "match_started", timeout=10)
-        match_started_b = await _drain_until(ws_b, "match_started", timeout=10)
-        check("A receives match_started", match_started_a is not None)
-        check("B receives match_started", match_started_b is not None)
-
-        first_a = await _drain_until(ws_a, "question_started", timeout=5)
-        first_b = await _drain_until(ws_b, "question_started", timeout=5)
-        check("A receives question_started for question 0", first_a is not None)
-        check("B receives question_started for question 0", first_b is not None)
-
-        # Neither player answers -- once question 0's window (server-side
-        # BATTLE_QUESTION_TIME_LIMIT_SECONDS) elapses, both connected
-        # processes' progression timers independently push question 1 to
-        # both sockets at (approximately) the same instant.
-        second_a = await _drain_until(
-            ws_a, "question_started", timeout=settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS + 5
-        )
-        second_b = await _drain_until(
-            ws_b, "question_started", timeout=settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS + 5
-        )
-        check("A automatically advances to question 1 without answering", second_a is not None)
-        check("B automatically advances to question 1 without answering", second_b is not None)
-        check(
-            "both players are on the SAME question_index",
-            second_a is not None and second_b is not None and second_a.get("question_index") == second_b.get("question_index") == 1,
-        )
-
-        forfeit_resp = await client.post(
-            f"{BASE_URL}/api/v1/battle/match/{match_id}/forfeit",
-            headers={"Authorization": f"Bearer {clerk_a3}"},
-        )
-        check("A forfeits to end this match cleanly (200)", forfeit_resp.status_code == 200)
+async def run_concurrent_fast_matches(client: httpx.AsyncClient, matches: int = 5) -> None:
+    print(f"\n== Load: {matches} fast matches at once ({matches * 2} players, same subject) ==")
+    pairs = [(f"{CLERK_A}-load{i}", f"{CLERK_B}-load{i}") for i in range(matches)]
+    # Matched one pair at a time so each pair meets each other (joining all
+    # at once could pair A0 with B1); then all of them play at once.
+    match_ids = [await _join_and_match(client, a, b, "Science") for a, b in pairs]
+    results = await asyncio.gather(*(
+        _run_fast_match(client, a, b, "Science", f"load #{i}", match_id=mid)
+        for i, ((a, b), mid) in enumerate(zip(pairs, match_ids, strict=True))
+    ))
+    _report_latencies("save round trips under load", [x for r in results for x in r])
 
 
 async def run_ai_failure_release_check(client: httpx.AsyncClient) -> None:
@@ -490,7 +586,8 @@ async def main() -> int:
             print("Server ready.")
 
             await run_full_flow(client)
-            await run_question_boundary_flow(client)
+            await run_fast_play_flow(client)
+            await run_concurrent_fast_matches(client)
             await run_ai_failure_release_check(client)
     finally:
         server.should_exit = True

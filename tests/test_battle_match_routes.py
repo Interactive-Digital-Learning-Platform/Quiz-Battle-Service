@@ -2,7 +2,7 @@
 tests/test_battle_match_routes.py
 ──────────────────────────────────────
 HTTP-level integration tests for GET /api/v1/battle/match/{id}/state,
-POST /api/v1/battle/match/{id}/answer, and POST /api/v1/battle/match/{id}/ready
+POST /api/v1/battle/match/{id}/answer + /skip, and POST /api/v1/battle/match/{id}/ready
 -- real DB + fake_redis, real routing, real Pydantic response validation.
 Mirrors tests/test_battle_routes.py's style. Ready/forfeit-specific edge
 cases beyond activation live in tests/test_battle_ready_forfeit_service.py
@@ -23,7 +23,6 @@ from app.services.user_service import get_or_create_user
 from tests.conftest import TEST_CLERK_ID
 
 N = settings.BATTLE_QUESTION_COUNT
-Q = settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
 
 
 def _fixed_questions(count: int = N) -> list[Question]:
@@ -167,20 +166,21 @@ async def test_answer_endpoint_never_leaks_correct_answer(client, db_session, fa
 
     await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=1))
     state_resp = await client.get(f"/api/v1/battle/match/{match.id}/state")
-    # Only 1s into a still-answerable question -- current_question_correct_
-    # answer must be null (not yet safe to reveal). Checking the substring
-    # "correct_answer" against the whole serialized body would false-positive
-    # on this field's own KEY name once it's legitimately present (see
-    # BattleMatchStateResponse.current_question_correct_answer) -- assert its
-    # value instead.
-    assert state_resp.json().get("current_question_correct_answer") is None
+    assert "correct" not in json.dumps(state_resp.json()).replace('"is_correct": null', "")
 
     answer_resp = await client.post(
         f"/api/v1/battle/match/{match.id}/answer",
         json={"question_id": questions[0].id, "selected_option": "A"},
     )
     assert answer_resp.status_code == 200
-    assert "correct_answer" not in json.dumps(answer_resp.json())
+    assert "correct" not in json.dumps(answer_resp.json())
+    # The response is the next question -- handed out only after the answer was saved.
+    assert answer_resp.json()["question_index"] == 1
+    assert answer_resp.json()["question"]["question_id"] == questions[1].id
+
+    skip_resp = await client.post(f"/api/v1/battle/match/{match.id}/skip", json={"question_id": questions[1].id})
+    assert skip_resp.status_code == 200
+    assert skip_resp.json()["question_index"] == 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,29 +220,31 @@ async def test_full_end_to_end_battle_flow(client, db_session, fake_redis):
     state_resp = await client.get(f"/api/v1/battle/match/{match_id}/state")
     assert state_resp.json()["status"] == "active"
 
-    # "me" answers every question correctly, advancing through each
-    # question's window in turn; the opponent never answers. Grading is
-    # deferred to the reveal boundary (normally driven by the WS
-    # progression timer, see battle_ws.py's _progression_timer) -- this
-    # REST-only flow forces that boundary explicitly after each submission
-    # so match completion/scoring still gets exercised end-to-end.
+    # "me" answers every question correctly at their own pace; the opponent
+    # never answers, so the match only ends once its clock runs out.
     for i in range(N):
-        await _set_started_at(db_session, match_id, datetime.now(UTC) - timedelta(seconds=i * Q + 1))
         answer_resp = await client.post(
             f"/api/v1/battle/match/{match_id}/answer",
             json={"question_id": questions[i].id, "selected_option": "A"},
         )
         assert answer_resp.status_code == 200
-        assert answer_resp.json()["selected_option"] == "A"
-        match = await battle_gameplay_service.get_match_row(db_session, match_id)
-        await battle_gameplay_service._grade_and_reveal_question(db_session, fake_redis, match=match, order=i)
+        assert answer_resp.json()["question_index"] == i + 1
+    assert answer_resp.json()["finished"] is True
+    assert answer_resp.json()["question"] is None
 
-    await _set_started_at(db_session, match_id, datetime.now(UTC) - timedelta(seconds=N * Q + 1))
+    await _set_started_at(
+        db_session, match_id,
+        datetime.now(UTC) - timedelta(
+            seconds=settings.BATTLE_MATCH_DURATION_SECONDS + settings.BATTLE_ANSWER_LATE_GRACE_SECONDS
+            + settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS + 1
+        ),
+    )
     final_state_resp = await client.get(f"/api/v1/battle/match/{match_id}/state")
     assert final_state_resp.status_code == 200
     final_data = final_state_resp.json()
     assert final_data["status"] == "completed"
     assert final_data["result"]["winner_user_id"] == me.id
+    assert [r["status"] for r in final_data["review"]] == ["correct"] * N
 
     profile_resp = await client.get("/api/v1/battle/profile")
     assert profile_resp.status_code == 200

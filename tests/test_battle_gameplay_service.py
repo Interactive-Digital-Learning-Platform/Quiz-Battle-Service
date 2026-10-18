@@ -3,8 +3,9 @@ tests/test_battle_gameplay_service.py
 ──────────────────────────────────────────
 Integration tests (in-memory DB, no HTTP, no real sleeps) for
 app/services/battle_gameplay_service.py -- ready-gated activation
-("waiting"->"countdown"->"active"), timestamp-derived question progression,
-answer submission/validation, match completion, and rating application.
+("waiting"->"countdown"->"active"), self-paced Next/Skip progression,
+answer submission/validation/scoring, match completion, and rating
+application.
 Question selection is mocked (deterministic, fixed question set) so tests
 don't depend on Groq/pool machinery -- that's covered separately in
 tests/test_battle_question_service.py. Ready/forfeit/disconnect-specific
@@ -17,12 +18,13 @@ auto-synchronizes the session's identity map, so a subsequent `db.get()`
 picks up the change without an explicit refresh (verified directly against
 aiosqlite before writing these tests).
 """
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.core.config import settings
 from app.models.battle_match import (
@@ -33,14 +35,15 @@ from app.models.battle_match import (
 )
 from app.models.competitive_rating import CompetitiveSubjectRating
 from app.models.question import Question
-from app.services import battle_gameplay_service
+from app.services import battle_gameplay_service, battle_ws_events, matchmaking_service
 from app.services.battle_question_service import BattleQuestionSelectionError
 from app.services.elo_engine import compute_elo_update
 from app.services.user_service import get_or_create_user
 
 N = settings.BATTLE_QUESTION_COUNT
-Q = settings.BATTLE_QUESTION_TIME_LIMIT_SECONDS
-TOTAL = N * Q
+DURATION = settings.BATTLE_MATCH_DURATION_SECONDS
+# Past the match clock AND the late-answer grace -- answers are closed.
+CLOSED = DURATION + settings.BATTLE_ANSWER_LATE_GRACE_SECONDS + settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS + 1
 
 
 async def _make_user(db, clerk_id: str):
@@ -121,20 +124,61 @@ async def _set_started_at(db, match_id: int, when: datetime) -> None:
     await db.commit()
 
 
-async def _submit_and_grade(db, redis, match, *, order, user_id, question_id, selected_option):
-    """Submits (upserts the Redis pending answer) then immediately forces
-    the reveal-boundary grading pass for that question slot -- these tests
-    don't run the real progression timer loop (battle_ws.py), so this
-    simulates "the boundary just fired" deterministically regardless of
-    wall-clock time. Grades BOTH participants together (same as
-    production); returns the result for `user_id` specifically.
+async def _answer(db, redis, match, *, user_id, question_id, selected_option):
+    """Next (selected_option set) or Skip (None) for this player's current
+    question -- returns the AnswerOutcome.
     """
-    await battle_gameplay_service.submit_battle_answer(
+    return await battle_gameplay_service.submit_battle_answer(
         db, match_id=match.id, user_id=user_id, question_id=question_id,
         selected_option=selected_option, redis=redis,
     )
-    event = await battle_gameplay_service._grade_and_reveal_question(db, redis, match=match, order=order)
-    return next(r for r in event.results if r.user_id == user_id)
+
+
+async def _answer_all(db, redis, match, questions, *, user_id, selected_option="A"):
+    outcome = None
+    for q in questions:
+        outcome = await _answer(db, redis, match, user_id=user_id, question_id=q.id, selected_option=selected_option)
+    return outcome
+
+
+async def _answer_row(db, match_id: int, user_id: int, question_id: int) -> BattleAnswer:
+    return (
+        await db.execute(
+            select(BattleAnswer).where(
+                BattleAnswer.match_id == match_id, BattleAnswer.user_id == user_id,
+                BattleAnswer.question_id == question_id,
+            )
+        )
+    ).scalar_one()
+
+
+async def _answer_count(db, match_id: int, user_id: int) -> int:
+    return await db.scalar(
+        select(func.count()).select_from(BattleAnswer).where(
+            BattleAnswer.match_id == match_id, BattleAnswer.user_id == user_id,
+        )
+    )
+
+
+async def _participant(db, match_id: int, user_id: int) -> BattleParticipant:
+    p = (
+        await db.execute(
+            select(BattleParticipant).where(BattleParticipant.match_id == match_id, BattleParticipant.user_id == user_id)
+        )
+    ).scalar_one()
+    await db.refresh(p)
+    return p
+
+
+async def _new_active_match(db, redis, subject="Mathematics"):
+    user_a = await _make_user(db, "user-a")
+    user_b = await _make_user(db, "user-b")
+    match = await _create_waiting_match(
+        db, subject=subject, difficulty="Mostly Medium",
+        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
+    )
+    _, questions = await _seed_and_activate(db, redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
+    return user_a, user_b, match, questions
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,8 +198,7 @@ async def test_activation_selects_questions_and_transitions_to_active(db_session
     )
 
     assert state["status"] == "active"
-    # Lockstep play: only the single current question (index 0, right after
-    # activation) is delivered.
+    # Everyone starts on question 0.
     assert state["question_index"] == 0
     assert state["question"]["question_id"] == questions[0].id
     mq_rows = (
@@ -237,124 +280,129 @@ async def test_ai_failure_cancels_match_cleanly(db_session, fake_redis):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lockstep active state: per-question timer, current question, progress arrays
+# Active state: one match clock, each player's own current question
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def test_time_remaining_reflects_current_question_window(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
+async def test_active_state_has_the_match_clock_and_the_players_own_question(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
 
-    # _seed_and_activate backdates started_at by 1s -- still well within
-    # question 0's Q-second window.
     state = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
+    # _seed_and_activate backdates started_at by 1s.
+    assert state["time_remaining_seconds"] == pytest.approx(DURATION - 1, abs=0.5)
+    assert state["ends_at"] == battle_gameplay_service.match_ends_at(match)
+    assert state["server_time"] is not None
     assert state["question_index"] == 0
-    assert state["time_remaining_seconds"] == pytest.approx(Q - 1, abs=0.5)
-
-    # Advance into question 2's window.
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=2 * Q + 1))
-    state2 = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
-    assert state2["question_index"] == 2
-    assert state2["question"]["question_id"] == questions[2].id
-    assert state2["time_remaining_seconds"] == pytest.approx(Q - 1, abs=0.5)
-
-
-async def test_answered_current_question_reflected_in_progress_arrays(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
-
-    await _submit_and_grade(
-        db_session, fake_redis, match, order=0, user_id=user_a.id,
-        question_id=questions[0].id, selected_option="A",
-    )
-
-    state = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
-    assert state["has_answered_current_question"] is True
-    assert state["my_progress"]["answered_count"] == 1
-    assert state["my_answers"] == [{"question_order": 0, "is_correct": True, "answered": True}]
-    # Grading locks BOTH participants together at the reveal boundary --
-    # user_b never submitted anything, but the question is still graded
-    # (as incorrect/unanswered) for them the instant user_a's answer locks.
-    assert state["opponent_answers"] == [{"question_order": 0, "is_correct": False, "answered": False}]
+    assert state["question"]["question_id"] == questions[0].id
+    assert state["finished"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Answer submission validation
+# Next / Skip: save first, then move on -- each player at their own pace
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def test_submit_answer_grading_mirrors_submit_quiz_rule(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
+async def test_next_saves_the_answer_then_moves_only_that_player_on(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+
+    outcome = await _answer(
+        db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A",
     )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
+    assert outcome.next["question_index"] == 1
+    assert outcome.next["question"]["question_id"] == questions[1].id
+    assert outcome.next["finished"] is False
+    assert outcome.progress == {"user_id": user_a.id, "question_order": 0, "answered": True, "answered_count": 1}
+    assert (await _answer_row(db_session, match.id, user_a.id, questions[0].id)).is_correct is True
+
+    state_a = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
+    state_b = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_b.id)
+    assert state_a["question_index"] == 1
+    assert state_b["question_index"] == 0  # the opponent is still on their own question 0
+    assert state_b["opponent_progress"]["answered_count"] == 1
+
+
+async def test_correctness_is_never_revealed_while_the_match_is_live(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+
+    outcome = await _answer(
+        db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="B",
+    )
+    assert "is_correct" not in outcome.next and "correct_answer" not in str(outcome.next)
+
+    state_a = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
+    state_b = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_b.id)
+    assert state_a["my_answers"] == [{"question_order": 0, "is_correct": None, "answered": True}]
+    assert state_b["opponent_answers"] == [{"question_order": 0, "is_correct": None, "answered": True}]
+
+
+async def test_grading_mirrors_submit_quiz_rule(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
 
     # Case-insensitive, whitespace-stripped exact match, correct_answer="A".
-    result = await _submit_and_grade(
-        db_session, fake_redis, match, order=0, user_id=user_a.id,
-        question_id=questions[0].id, selected_option="  a  ",
-    )
-    assert result.is_correct is True
-    assert result.base_score == settings.BATTLE_SCORE_BASE_CORRECT
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="  a  ")
+    row = await _answer_row(db_session, match.id, user_a.id, questions[0].id)
+    assert row.is_correct is True
+    assert row.base_score == settings.BATTLE_SCORE_BASE_CORRECT
 
 
-async def test_submit_answer_rejects_non_participant(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    outsider = await _make_user(db_session, "outsider")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
+async def test_wrong_answer_scores_zero(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="B")
+    row = await _answer_row(db_session, match.id, user_a.id, questions[0].id)
+    assert (row.is_correct, row.total_question_score) == (False, 0)
+
+
+async def test_skip_saves_a_zero_point_skip_and_moves_on(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+
+    outcome = await _answer(
+        db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option=None,
     )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
+    assert outcome.next["question_index"] == 1
+    assert outcome.progress["answered"] is False
+    row = await _answer_row(db_session, match.id, user_a.id, questions[0].id)
+    assert (row.selected_option, row.is_correct, row.total_question_score) == ("", False, 0)
+
+    state_b = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_b.id)
+    assert state_b["opponent_answers"] == [{"question_order": 0, "is_correct": None, "answered": False}]
+
+
+async def test_spamming_next_saves_exactly_one_answer(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+
+    first = await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    # The same Next again (double tap / resent after a lost reply), even with a different pick.
+    again = await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="B")
+
+    assert again.progress is None  # nothing new saved
+    assert again.next["question_index"] == first.next["question_index"] == 1
+    assert again.next["question"] == first.next["question"]
+    rows = (
+        await db_session.execute(select(BattleAnswer).where(BattleAnswer.match_id == match.id))
+    ).scalars().all()
+    assert [(r.question_id, r.selected_option) for r in rows] == [(questions[0].id, "A")]
+    assert (await _participant(db_session, match.id, user_a.id)).current_question_index == 1
+
+
+async def test_a_resent_answer_for_an_earlier_question_returns_the_current_one(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[1].id, selected_option="A")
+
+    late = await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    assert late.progress is None
+    assert late.next["question_index"] == 2
+
+
+async def test_cannot_jump_ahead_to_a_later_question(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
 
     with pytest.raises(HTTPException) as exc_info:
-        await battle_gameplay_service.submit_battle_answer(
-            db_session, match_id=match.id, user_id=outsider.id, question_id=questions[0].id, selected_option="A",
-        )
-    assert exc_info.value.status_code == 403
-
-
-async def test_submit_answer_rejects_a_non_current_question_in_the_same_match(db_session, fake_redis):
-    # Lockstep play: only the CURRENT question (index 0, right after
-    # activation) may be answered -- a later question in this same match's
-    # own frozen set is rejected exactly like a foreign one.
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await battle_gameplay_service.submit_battle_answer(
-            db_session, match_id=match.id, user_id=user_a.id,
-            question_id=questions[1].id, selected_option="A",
-        )
+        await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[1].id, selected_option="A")
     assert exc_info.value.status_code == 400
 
 
 async def test_submit_answer_rejects_question_from_a_foreign_match(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
-
+    user_a, _, match, _ = await _new_active_match(db_session, fake_redis)
     foreign_question = Question(
         question="Foreign?", options=["A", "B"], correct_answer="A",
         subject="Mathematics", lesson="Algebra", difficulty="medium",
@@ -364,153 +412,363 @@ async def test_submit_answer_rejects_question_from_a_foreign_match(db_session, f
     await db_session.refresh(foreign_question)
 
     with pytest.raises(HTTPException) as exc_info:
-        await battle_gameplay_service.submit_battle_answer(
-            db_session, match_id=match.id, user_id=user_a.id,
-            question_id=foreign_question.id, selected_option="A",
-        )
+        await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=foreign_question.id, selected_option="A")
     assert exc_info.value.status_code == 400
 
 
-async def test_resubmitting_before_lock_overwrites_the_pending_answer(db_session, fake_redis):
-    # Editable answers: a player may change their mind any number of times
-    # while the question is still open -- whichever submission is in effect
-    # when grading runs (the reveal boundary) is the one that's authoritative.
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
+async def test_submit_answer_rejects_non_participant(db_session, fake_redis):
+    _, _, match, questions = await _new_active_match(db_session, fake_redis)
+    outsider = await _make_user(db_session, "outsider")
 
-    await battle_gameplay_service.submit_battle_answer(
-        db_session, match_id=match.id, user_id=user_a.id, question_id=questions[0].id,
-        selected_option="B", redis=fake_redis,
-    )
-    # Changed their mind to the correct option before the reveal boundary.
-    await battle_gameplay_service.submit_battle_answer(
-        db_session, match_id=match.id, user_id=user_a.id, question_id=questions[0].id,
-        selected_option="A", redis=fake_redis,
-    )
-    event = await battle_gameplay_service._grade_and_reveal_question(db_session, fake_redis, match=match, order=0)
-    result = next(r for r in event.results if r.user_id == user_a.id)
-    assert result.is_correct is True  # graded on the LAST submission ("A"), not the first ("B")
-
-
-async def test_resubmitting_after_lock_is_rejected(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
-
-    await _submit_and_grade(
-        db_session, fake_redis, match, order=0, user_id=user_a.id,
-        question_id=questions[0].id, selected_option="A",
-    )
     with pytest.raises(HTTPException) as exc_info:
-        await battle_gameplay_service.submit_battle_answer(
-            db_session, match_id=match.id, user_id=user_a.id, question_id=questions[0].id,
-            selected_option="B", redis=fake_redis,
-        )
+        await _answer(db_session, fake_redis, match, user_id=outsider.id, question_id=questions[0].id, selected_option="A")
+    assert exc_info.value.status_code == 403
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hidden per-question timer + speed bonus
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _set_presented_at(db, match_id: int, user_id: int, when: datetime) -> None:
+    await db.execute(
+        update(BattleParticipant)
+        .where(BattleParticipant.match_id == match_id, BattleParticipant.user_id == user_id)
+        .values(current_question_presented_at=when)
+    )
+    await db.commit()
+
+
+@pytest.mark.parametrize(
+    ("seconds_taken", "speed_bonus"), [(3, 30), (4.9, 30), (8, 20), (12, 10), (20, 0)],
+)
+async def test_speed_bonus_follows_the_time_since_the_question_was_handed_out(
+    db_session, fake_redis, seconds_taken, speed_bonus,
+):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    # Question 0 starts at match.started_at.
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=seconds_taken))
+
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    row = await _answer_row(db_session, match.id, user_a.id, questions[0].id)
+    assert row.response_time_ms == pytest.approx(seconds_taken * 1000, abs=300)
+    assert row.speed_bonus == speed_bonus
+    assert row.total_question_score == settings.BATTLE_SCORE_BASE_CORRECT + speed_bonus
+
+
+async def test_each_question_is_timed_from_when_that_player_got_it(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    # The match started long ago, but question 1 was only handed out 2s ago.
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=60))
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    await _set_presented_at(db_session, match.id, user_a.id, datetime.now(UTC) - timedelta(seconds=2))
+
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[1].id, selected_option="A")
+    assert (await _answer_row(db_session, match.id, user_a.id, questions[0].id)).speed_bonus == 0
+    assert (await _answer_row(db_session, match.id, user_a.id, questions[1].id)).speed_bonus == 30
+
+
+async def test_network_allowance_takes_the_fastest_round_trip_off(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    for rtt in (0.9, 0.4, 0.6):
+        await battle_gameplay_service.record_rtt_sample(fake_redis, match_id=match.id, user_id=user_a.id, rtt_seconds=rtt)
+    # 5.3s on the server clock - 0.4s fastest round trip = 4.9s -> still the 5s tier.
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=5.3))
+
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    row = await _answer_row(db_session, match.id, user_a.id, questions[0].id)
+    assert row.response_time_ms == pytest.approx(4900, abs=150)
+    assert row.speed_bonus == 30
+
+
+async def test_network_allowance_is_capped(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    # A client delaying every pong to look slow gains at most the cap.
+    await battle_gameplay_service.record_rtt_sample(fake_redis, match_id=match.id, user_id=user_a.id, rtt_seconds=4.0)
+    assert await battle_gameplay_service.network_allowance_seconds(
+        fake_redis, match_id=match.id, user_id=user_a.id,
+    ) == settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=8))
+
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    row = await _answer_row(db_session, match.id, user_a.id, questions[0].id)
+    expected_ms = (8 - settings.BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS) * 1000
+    assert row.response_time_ms == pytest.approx(expected_ms, abs=150)
+    assert row.speed_bonus == 20
+
+
+async def test_only_the_last_few_round_trips_count(db_session, fake_redis):
+    user_a, _, match, _ = await _new_active_match(db_session, fake_redis)
+    await battle_gameplay_service.record_rtt_sample(fake_redis, match_id=match.id, user_id=user_a.id, rtt_seconds=0.05)
+    for _ in range(settings.BATTLE_RTT_SAMPLE_COUNT):
+        await battle_gameplay_service.record_rtt_sample(fake_redis, match_id=match.id, user_id=user_a.id, rtt_seconds=0.3)
+    assert await battle_gameplay_service.network_allowance_seconds(
+        fake_redis, match_id=match.id, user_id=user_a.id,
+    ) == pytest.approx(0.3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The match clock, finishing early, and the end-of-match review
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def test_an_answer_arriving_after_the_clock_hits_zero_is_refused(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    # The visible clock ran out 0.5s ago -- no grace, the answer is too late.
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=DURATION + 0.5))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+
     assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == battle_gameplay_service.TIME_UP_DETAIL
+    await db_session.refresh(match)  # the refusal rolled the session back
+    await db_session.refresh(user_a)
+    assert await _answer_count(db_session, match.id, user_a.id) == 0
 
 
-async def test_submit_answer_rejects_after_match_completed(db_session, fake_redis):
+async def test_a_slow_connection_gets_its_own_0_00_cutoff(db_session, fake_redis):
+    # A 1.5s round trip: the phone's countdown runs ~1.5s behind the server's,
+    # so an answer arriving 1s after the server's 0:00 was sent before the
+    # player's own 0:00 -- it counts. A fast connection gets no such leeway.
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    await battle_gameplay_service.record_rtt_sample(fake_redis, match_id=match.id, user_id=user_a.id, rtt_seconds=1.5)
+    await battle_gameplay_service.record_rtt_sample(fake_redis, match_id=match.id, user_id=user_b.id, rtt_seconds=0.05)
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=DURATION + 1.0))
+
+    outcome = await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    assert outcome.progress is not None
+    with pytest.raises(HTTPException) as exc_info:
+        await _answer(db_session, fake_redis, match, user_id=user_b.id, question_id=questions[0].id, selected_option="A")
+    assert exc_info.value.detail == battle_gameplay_service.TIME_UP_DETAIL
+
+
+async def test_an_answer_whose_save_outlasts_the_clock_is_refused(db_session, fake_redis, monkeypatch):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    # 0.2s left on the clock when the answer arrives, but the save takes 0.6s.
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=DURATION - 0.2))
+
+    async def slow_allowance(*args, **kwargs):
+        await asyncio.sleep(0.6)
+        return 0.0
+
+    monkeypatch.setattr(battle_gameplay_service, "network_allowance_seconds", slow_allowance)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+
+    assert exc_info.value.detail == battle_gameplay_service.TIME_UP_DETAIL
+    # The refusal rolled the session back, expiring the loaded rows.
+    await db_session.refresh(match)
+    await db_session.refresh(user_a)
+    assert await _answer_count(db_session, match.id, user_a.id) == 0
+    participant = await _participant(db_session, match.id, user_a.id)
+    assert participant.current_question_index == 0  # not moved on either
+
+
+async def test_answers_after_the_grace_are_rejected_and_the_match_ends(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == battle_gameplay_service.TIME_UP_DETAIL
+    await db_session.refresh(match)
+    assert match.status == "completed"
+
+
+async def test_a_finished_player_cannot_forfeit(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await battle_gameplay_service.forfeit_match(db_session, fake_redis, match_id=match.id, forfeiting_user_id=user_a.id)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == battle_gameplay_service.FINISHED_CANT_FORFEIT_DETAIL
+    await db_session.refresh(match)
+    assert match.status == "active"
+
+
+async def test_queue_status_says_when_a_finished_player_awaits_the_opponent(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    for user in (user_a, user_b):
+        await fake_redis.hset(f"battle:user_state:{user.id}", mapping={"state": "in_match", "match_id": match.id})
+
+    async def awaiting(user) -> bool:
+        status = await matchmaking_service.get_queue_status(db_session, fake_redis, user_id=user.id)
+        assert status["status"] == "matched"
+        return status["awaiting_opponent"]
+
+    assert await awaiting(user_a) is False  # still playing
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
+    assert await awaiting(user_a) is True
+    assert await awaiting(user_b) is False  # B is the one still playing
+
+
+async def test_streak_bonus_builds_on_consecutive_correct_answers_and_resets(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+    # correct, correct, correct, skip, correct, wrong, correct, correct
+    for q, option in zip(questions, ["A", "A", "A", None, "A", "B", "A", "A"], strict=False):
+        await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=q.id, selected_option=option)
+
+    bonuses = [
+        (await _answer_row(db_session, match.id, user_a.id, q.id)).streak_bonus for q in questions[:8]
+    ]
+    assert bonuses == [0, 5, 10, 0, 0, 0, 0, 5]
+    row = await _answer_row(db_session, match.id, user_a.id, questions[2].id)
+    assert row.total_question_score == row.base_score + row.speed_bonus + row.streak_bonus
+
+
+async def test_review_shows_each_answers_streak_bonus(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_b.id)
+
+    state = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id, redis=fake_redis)
+
+    assert [r["streak_bonus"] for r in state["review"]] == [0, 5, 10, 15, 20, 20, 20, 20, 20, 20]
+    assert state["result"]["me"]["final_score"] == sum(r["total_question_score"] for r in state["review"])
+
+
+async def test_a_second_activation_attempt_doesnt_announce_the_countdown_again(db_session, fake_redis):
+    # Picking questions can take seconds now (AI first); a second trigger for
+    # the same match (the other player's connect, the reaper's forced start)
+    # must find it already started and not publish countdown_started again.
     user_a = await _make_user(db_session, "user-a")
     user_b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(
+        db_session, subject="Mathematics", difficulty="Mostly Medium",
+        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
+    )
+    questions = _fixed_questions()
+    db_session.add_all(questions)
+    await db_session.flush()
+
+    with patch(
+        "app.services.battle_gameplay_service.select_battle_questions", new=AsyncMock(return_value=questions),
+    ), patch.object(battle_gameplay_service.ws_manager, "publish", new=AsyncMock()) as publish:
+        first = await battle_gameplay_service._finalize_activation(db_session, fake_redis, match=match)
+        second = await battle_gameplay_service._finalize_activation(db_session, fake_redis, match=match)
+
+    assert first.status == second.status == "countdown"
+    assert [c.kwargs["event"]["type"] for c in publish.await_args_list] == ["countdown_started"]
+
+
+async def _end_reason(db, redis, match, user_id) -> str | None:
+    state = await battle_gameplay_service.get_match_state(db, match_id=match.id, user_id=user_id, redis=redis)
+    assert state["status"] == "completed"
+    return state["result"]["end_reason"]
+
+
+async def test_end_reason_all_finished_when_both_players_got_through_every_question(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_b.id)
+
+    assert await _end_reason(db_session, fake_redis, match, user_a.id) == "all_finished"
+    event = await battle_ws_events.match_finished_event(db_session, match)
+    assert event["end_reason"] == "all_finished"
+
+
+async def test_end_reason_time_up_when_the_clock_ran_out_first(db_session, fake_redis):
+    # A finished, B didn't -- only the clock could have ended it.
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
+
+    assert await _end_reason(db_session, fake_redis, match, user_b.id) == "time_up"
+
+
+async def test_end_reason_forfeit(db_session, fake_redis):
+    user_a, user_b, match, _ = await _new_active_match(db_session, fake_redis)
+    await battle_gameplay_service.forfeit_match(db_session, fake_redis, match_id=match.id, forfeiting_user_id=user_b.id)
+
+    assert await _end_reason(db_session, fake_redis, match, user_a.id) == "forfeit"
+
+
+async def test_a_player_who_finishes_first_waits_for_the_opponent(db_session, fake_redis):
+    user_a, _, match, questions = await _new_active_match(db_session, fake_redis)
+
+    last = await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
+    assert last.next == {**last.next, "question_index": N, "question": None, "finished": True}
+    assert last.match.status == "active"  # the opponent is still playing
+    assert (await _participant(db_session, match.id, user_a.id)).finished_at is not None
+
+    # Another Next after finishing is a harmless repeat.
+    again = await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[-1].id, selected_option="A")
+    assert again.progress is None and again.next["finished"] is True
+
+
+async def test_the_match_ends_as_soon_as_both_players_finish(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
     await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
     await _seed_rating(db_session, user_b.id, "Mathematics", 1000)
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
+    await fake_redis.hset(f"battle:user_state:{user_a.id}", "state", "in_match")
 
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL + 1))
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
+    last = await _answer_all(db_session, fake_redis, match, questions, user_id=user_b.id, selected_option=None)
+
+    assert last.match.status == "completed"
+    assert last.match.winner_user_id == user_a.id
+    assert await fake_redis.exists(f"battle:user_state:{user_a.id}") == 0
+
+
+async def test_highest_score_wins(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
+    await _seed_rating(db_session, user_b.id, "Mathematics", 1000)
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=30))
+
+    # A: question 0 right but slow (100), then skips the rest.
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    for q in questions[1:]:
+        await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=q.id, selected_option=None)
+    # B: question 0 skipped, question 1 right and fast (130), rest skipped.
+    await _answer(db_session, fake_redis, match, user_id=user_b.id, question_id=questions[0].id, selected_option=None)
+    await _answer(db_session, fake_redis, match, user_id=user_b.id, question_id=questions[1].id, selected_option="A")
+    last = None
+    for q in questions[2:]:
+        last = await _answer(db_session, fake_redis, match, user_id=user_b.id, question_id=q.id, selected_option=None)
+
+    assert last.match.status == "completed"
+    assert last.match.winner_user_id == user_b.id
+
+
+async def test_review_shows_only_the_viewers_own_answers(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
+    await _seed_rating(db_session, user_b.id, "Mathematics", 1000)
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[1].id, selected_option="B")
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[2].id, selected_option=None)
+    await _answer_all(db_session, fake_redis, match, questions[:4], user_id=user_b.id, selected_option="C")
+
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
     state = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
     assert state["status"] == "completed"
 
-    with pytest.raises(HTTPException) as exc_info:
-        await battle_gameplay_service.submit_battle_answer(
-            db_session, match_id=match.id, user_id=user_a.id, question_id=questions[0].id, selected_option="A",
-        )
-    assert exc_info.value.status_code == 409
+    review = state["review"]
+    assert [r["status"] for r in review] == ["correct", "incorrect", "skipped"] + ["unanswered"] * (N - 3)
+    assert [r["selected_option"] for r in review[:4]] == ["A", "B", None, None]
+    assert all(r["correct_answer"] == "A" for r in review)
+    assert review[0]["total_question_score"] == review[0]["base_score"] + review[0]["speed_bonus"] > 0
+    assert sorted(review[0]["options"]) == ["A", "B", "C", "D"]
+    assert "C" not in [r["selected_option"] for r in review]  # never the opponent's picks
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Streak behavior (lockstep play: rebased to the frozen question_order --
-# a question whose window closed with no answer from this player BREAKS the
-# streak exactly like a wrong one, since there's no self-paced "I'll answer
-# it later" option anymore)
-# ─────────────────────────────────────────────────────────────────────────────
+async def test_match_completes_automatically_once_the_clock_runs_out(db_session, fake_redis):
+    user_a, _, match, _ = await _new_active_match(db_session, fake_redis)
+    await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
 
-async def test_streak_resets_on_wrong_answer(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
+    # Neither player answers anything -- the clock running out is the only
+    # thing that should force completion.
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
+    state = await battle_gameplay_service.get_match_state(
+        db_session, match_id=match.id, user_id=user_a.id, redis=fake_redis
     )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
-
-    # Q0: correct, Q1: wrong, Q2: correct -- streak at Q2 should be fresh
-    # (1), not accumulated from Q0, because Q1 was an actual wrong answer.
-    # Backdating started_at between submissions is what advances the shared
-    # "current question" for both players; each question is explicitly
-    # graded (simulating the reveal boundary) before advancing to the next,
-    # since _streak_before only sees already-graded BattleAnswer rows.
-    await _submit_and_grade(
-        db_session, fake_redis, match, order=0, user_id=user_a.id,
-        question_id=questions[0].id, selected_option="A",
-    )
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=1 * Q + 1))
-    await _submit_and_grade(
-        db_session, fake_redis, match, order=1, user_id=user_a.id,
-        question_id=questions[1].id, selected_option="WRONG",
-    )
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=2 * Q + 1))
-    result = await _submit_and_grade(
-        db_session, fake_redis, match, order=2, user_id=user_a.id,
-        question_id=questions[2].id, selected_option="A",
-    )
-    assert result.is_correct is True
-    assert result.streak_bonus == 0  # streak_after_this_answer=1 -> below tier1 threshold (2)
-
-
-async def test_streak_resets_when_a_question_is_skipped(db_session, fake_redis):
-    # A question whose window closes with no answer from this player is a
-    # miss, not a neutral skip -- it breaks the streak exactly like an
-    # actually-wrong answer (confirmed decision for the lockstep revert).
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
-
-    # Answer Q0 correct, let Q1's window close with no answer at all, then
-    # answer Q2 correct -- streak at Q2 must be fresh (1), not 2.
-    await _submit_and_grade(
-        db_session, fake_redis, match, order=0, user_id=user_a.id,
-        question_id=questions[0].id, selected_option="A",
-    )
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=1 * Q + 1))
-    # Q1's window closes with no answer from user_a at all -- still must be
-    # explicitly graded (deferred-grading design) to produce the "missed"
-    # BattleAnswer row that breaks the streak, same as the real progression
-    # timer does when nobody submits anything before the reveal boundary.
-    await battle_gameplay_service._grade_and_reveal_question(db_session, fake_redis, match=match, order=1)
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=2 * Q + 1))
-    result = await _submit_and_grade(
-        db_session, fake_redis, match, order=2, user_id=user_a.id,
-        question_id=questions[2].id, selected_option="A",
-    )
-    assert result.is_correct is True
-    assert result.streak_bonus == 0  # streak_after_this_answer=1, Q1 was missed
+    assert state["status"] == "completed"
+    assert state["result"]["winner_user_id"] is None  # neither answered anything -- draw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -518,31 +776,17 @@ async def test_streak_resets_when_a_question_is_skipped(db_session, fake_redis):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def test_completion_is_idempotent_and_rating_matches_elo_engine(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
     await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
     await _seed_rating(db_session, user_b.id, "Mathematics", 1000)
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
 
-    # user_a answers all N correctly, advancing through each question's
-    # window in turn; user_b answers none (misses every window). Each
-    # question is explicitly graded (simulating the reveal boundary a real
-    # progression timer would drive) before advancing to the next.
-    for i in range(N):
-        await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=i * Q + 1))
-        await _submit_and_grade(
-            db_session, fake_redis, match, order=i, user_id=user_a.id,
-            question_id=questions[i].id, selected_option="A",
-        )
+    # user_a answers all N correctly; user_b answers none.
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
 
     await fake_redis.hset(f"battle:user_state:{user_a.id}", "state", "in_match")
     await fake_redis.hset(f"battle:user_state:{user_b.id}", "state", "in_match")
 
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL + 1))
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
     state1 = await battle_gameplay_service.get_match_state(
         db_session, match_id=match.id, user_id=user_a.id, redis=fake_redis
     )
@@ -619,14 +863,9 @@ async def test_completion_only_touches_the_matched_subject_rating(db_session, fa
     )
     _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
 
-    for i in range(N):
-        await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=i * Q + 1))
-        await _submit_and_grade(
-            db_session, fake_redis, match, order=i, user_id=user_a.id,
-            question_id=questions[i].id, selected_option="A",
-        )
+    await _answer_all(db_session, fake_redis, match, questions, user_id=user_a.id)
 
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL + 1))
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
     state = await battle_gameplay_service.get_match_state(
         db_session, match_id=match.id, user_id=user_a.id, redis=fake_redis
     )
@@ -650,23 +889,14 @@ async def test_completion_only_touches_the_matched_subject_rating(db_session, fa
 
 
 async def test_running_average_response_time_formula(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
     await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
     await _seed_rating(db_session, user_b.id, "Mathematics", 1000)
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    _, questions = await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
 
-    # user_a answers question 0 near-instantly (fast), user_b never answers.
-    await _submit_and_grade(
-        db_session, fake_redis, match, order=0, user_id=user_a.id,
-        question_id=questions[0].id, selected_option="A",
-    )
+    # user_a answers question 0, user_b never answers.
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="A")
 
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL + 1))
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
     await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
 
     rating_a_row = (
@@ -679,12 +909,20 @@ async def test_running_average_response_time_formula(db_session, fake_redis):
     # Started with total_answers=0, average_response_time=0.0 -- after 1
     # answered question, new average = that one answer's response time.
     assert rating_a_row.total_answers == 1
-    answer_row = (
-        await db_session.execute(
-            select(BattleAnswer).where(BattleAnswer.match_id == match.id, BattleAnswer.user_id == user_a.id)
-        )
-    ).scalar_one()
+    answer_row = await _answer_row(db_session, match.id, user_a.id, questions[0].id)
     assert rating_a_row.average_response_time == pytest.approx(answer_row.response_time_ms / 1000.0, abs=0.01)
+
+
+async def test_skips_do_not_count_as_wrong_answers(db_session, fake_redis):
+    user_a, user_b, match, questions = await _new_active_match(db_session, fake_redis)
+    await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
+    await _seed_rating(db_session, user_b.id, "Mathematics", 1000)
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[0].id, selected_option="B")
+    await _answer(db_session, fake_redis, match, user_id=user_a.id, question_id=questions[1].id, selected_option=None)
+
+    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=CLOSED))
+    state = await battle_gameplay_service.get_match_state(db_session, match_id=match.id, user_id=user_a.id)
+    assert (state["result"]["me"]["correct_count"], state["result"]["me"]["wrong_count"]) == (0, 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -792,33 +1030,6 @@ async def test_reap_leaves_fresh_active_match_untouched(db_session, fake_redis):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Total time budget -> automatic completion (lockstep play has no explicit
-# "finish" action; the match ends purely once elapsed time exhausts the
-# whole question set's combined window)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def test_match_completes_automatically_once_total_time_budget_elapses(db_session, fake_redis):
-    user_a = await _make_user(db_session, "user-a")
-    user_b = await _make_user(db_session, "user-b")
-    await _seed_rating(db_session, user_a.id, "Mathematics", 1000)
-    await _seed_rating(db_session, user_b.id, "Mathematics", 1000)
-    match = await _create_waiting_match(
-        db_session, subject="Mathematics", difficulty="Mostly Medium",
-        user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000,
-    )
-    await _seed_and_activate(db_session, fake_redis, match, user_a_id=user_a.id, user_b_id=user_b.id)
-
-    # Neither player answers anything -- the total time budget expiring is
-    # the only thing that should force completion.
-    await _set_started_at(db_session, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL + 1))
-    state = await battle_gameplay_service.get_match_state(
-        db_session, match_id=match.id, user_id=user_a.id, redis=fake_redis
-    )
-    assert state["status"] == "completed"
-    assert state["result"]["winner_user_id"] is None  # neither answered anything -- draw
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # get_battle_history -- batched (not N+1) match/participant/username lookups
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -839,9 +1050,8 @@ async def _seed_rating_if_absent(db, user_id: int, subject: str, rating: int) ->
 
 
 async def _complete_match_with_winner(db, redis, *, subject, winner_id, loser_id) -> BattleMatch:
-    """Winner answers every question correctly, loser answers none, then the
-    total time budget is exhausted so completion runs -- mirrors
-    test_completion_is_idempotent_and_rating_matches_elo_engine's approach.
+    """Winner answers every question correctly, loser skips every one --
+    both finished, so the last skip completes the match.
     """
     await _seed_rating_if_absent(db, winner_id, subject, 1000)
     await _seed_rating_if_absent(db, loser_id, subject, 1000)
@@ -851,18 +1061,10 @@ async def _complete_match_with_winner(db, redis, *, subject, winner_id, loser_id
     )
     _, questions = await _seed_and_activate(db, redis, match, user_a_id=winner_id, user_b_id=loser_id)
 
-    for i in range(N):
-        await _set_started_at(db, match.id, datetime.now(UTC) - timedelta(seconds=i * Q + 1))
-        await _submit_and_grade(
-            db, redis, match, order=i, user_id=winner_id,
-            question_id=questions[i].id, selected_option="A",
-        )
-
-    await redis.hset(f"battle:user_state:{winner_id}", "state", "in_match")
-    await redis.hset(f"battle:user_state:{loser_id}", "state", "in_match")
-    await _set_started_at(db, match.id, datetime.now(UTC) - timedelta(seconds=TOTAL + 1))
-    await battle_gameplay_service.get_match_state(db, match_id=match.id, user_id=winner_id, redis=redis)
+    await _answer_all(db, redis, match, questions, user_id=winner_id)
+    await _answer_all(db, redis, match, questions, user_id=loser_id, selected_option=None)
     await db.refresh(match)
+    assert match.status == "completed"
     return match
 
 

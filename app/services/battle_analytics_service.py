@@ -8,7 +8,10 @@ derived from rows battle_gameplay_service already writes -- no new state:
 - record / recent form / rating history / stronger-opponent results come
   from BattleParticipant (one row per player per match);
 - the speed profile, points breakdown and topic strengths come from
-  BattleAnswer, joined to Question for each answer's lesson.
+  BattleAnswer, joined to Question for each answer's lesson;
+- question usage (answered / skipped / never reached) and how matches
+  ended come from BattleMatchQuestion, BattleAnswer and each participant's
+  self-paced progress (current_question_index, finished_at).
 
 Only status="completed" matches count (forfeits included -- they reuse
 "completed"); cancelled matches never applied ratings, same rule as
@@ -22,7 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.config import settings
-from app.models.battle_match import BattleAnswer, BattleMatch, BattleParticipant
+from app.models.battle_match import (
+    BattleAnswer,
+    BattleMatch,
+    BattleMatchQuestion,
+    BattleParticipant,
+)
 from app.models.question import Question
 
 _EPOCH = datetime.min.replace(tzinfo=UTC)
@@ -69,8 +77,13 @@ async def _participations(db: AsyncSession, *, user_id: int) -> list:
             select(
                 BattleMatch.id.label("match_id"),
                 BattleMatch.subject,
+                BattleMatch.started_at,
                 BattleMatch.finished_at,
                 me.result,
+                me.current_question_index.label("my_index"),
+                me.finished_at.label("my_finished_at"),
+                opp.current_question_index.label("opp_index"),
+                opp.result.label("opp_result"),
                 me.rating_before,
                 me.rating_after,
                 me.rating_change,
@@ -87,11 +100,10 @@ async def _participations(db: AsyncSession, *, user_id: int) -> list:
 
 def _answers_base(user_id: int):
     """WHERE shared by every answer-level aggregate: this user's answers in
-    completed matches only. Grading writes a row for every question slot,
-    including ones the player never answered (selected_option == "" sentinel,
-    see battle_gameplay_service._grade_one_participant) -- those are filtered
-    out exactly like _apply_result does, so a missed question doesn't count
-    as answered, as a wrong answer, or toward speed."""
+    completed matches only. A skipped question is saved as a row with the
+    selected_option == "" sentinel -- those are filtered out exactly like
+    _apply_result does, so a skip doesn't count as answered, as a wrong
+    answer, or toward speed (_question_usage counts them on their own)."""
     return (
         BattleAnswer.user_id == user_id,
         BattleMatch.status == "completed",
@@ -178,6 +190,63 @@ async def _topics(db: AsyncSession, *, user_id: int) -> list[dict]:
     return topics
 
 
+async def _question_usage(db: AsyncSession, *, user_id: int, answered: int) -> dict:
+    """What happened to every question this user was dealt in completed
+    matches: answered, skipped, or never reached (the clock ran out, or the
+    match ended by forfeit, before they got to it -- no answer row at all)."""
+    slots = await db.scalar(
+        select(func.count(BattleMatchQuestion.id))
+        .join(BattleMatch, BattleMatch.id == BattleMatchQuestion.match_id)
+        .join(
+            BattleParticipant,
+            and_(BattleParticipant.match_id == BattleMatch.id, BattleParticipant.user_id == user_id),
+        )
+        .where(BattleMatch.status == "completed")
+    ) or 0
+    skipped = await db.scalar(
+        select(func.count(BattleAnswer.id))
+        .join(BattleMatch, BattleMatch.id == BattleAnswer.match_id)
+        .where(BattleAnswer.user_id == user_id, BattleMatch.status == "completed", BattleAnswer.selected_option == "")
+    ) or 0
+    return {
+        "questions": int(slots),
+        "answered": answered,
+        "skipped": int(skipped),
+        "not_reached": max(0, int(slots) - answered - int(skipped)),
+    }
+
+
+def _match_endings(rows: list) -> dict:
+    """How this user's matches ended -- same rule as
+    battle_gameplay_service.match_end_reason -- and how long they took to
+    get through every question when they did. Matches with no progress
+    recorded for either player (played before self-paced matches, which
+    track it) are left out of the ending counts rather than guessed at."""
+    n = settings.BATTLE_QUESTION_COUNT
+    endings = {"all_finished": 0, "time_up": 0, "forfeit": 0}
+    finish_seconds = []
+    for r in rows:
+        my_index, opp_index = r.my_index or 0, r.opp_index or 0
+        if r.result == "forfeit" or r.opp_result == "forfeit":
+            endings["forfeit"] += 1
+        elif my_index == 0 and opp_index == 0:
+            continue
+        elif my_index >= n and opp_index >= n:
+            endings["all_finished"] += 1
+        else:
+            endings["time_up"] += 1
+        if my_index >= n and r.my_finished_at is not None and r.started_at is not None:
+            finished, started = r.my_finished_at, r.started_at
+            if finished.tzinfo is None:  # SQLite (tests)
+                finished, started = finished.replace(tzinfo=UTC), started.replace(tzinfo=UTC)
+            finish_seconds.append(max(0.0, (finished - started).total_seconds()))
+    return {
+        **endings,
+        "finished_all_questions": len(finish_seconds),
+        "average_finish_seconds": round(sum(finish_seconds) / len(finish_seconds), 1) if finish_seconds else None,
+    }
+
+
 async def get_battle_analytics(db: AsyncSession, *, user_id: int) -> dict:
     rows = await _participations(db, user_id=user_id)
 
@@ -233,6 +302,8 @@ async def get_battle_analytics(db: AsyncSession, *, user_id: int) -> dict:
         "speed_profile": await _speed_profile(db, user_id=user_id),
         "points": totals["points"],
         "topics": await _topics(db, user_id=user_id),
+        "question_usage": await _question_usage(db, user_id=user_id, answered=totals["answered"]),
+        "match_endings": _match_endings(rows),
         "vs_stronger": {
             "played": len(stronger),
             "wins": sum(1 for r in stronger if r.result == "win"),

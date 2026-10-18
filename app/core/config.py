@@ -12,6 +12,20 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
+    # Log every SQL statement. Off by default even in development: on a
+    # remote DB (Neon) the extra per-statement logging noticeably slows the
+    # many small queries behind each battle Next/Skip.
+    DB_ECHO: bool = False
+    # Longest any single SQL statement may run before it's abandoned with a
+    # TimeoutError -- a stalled connection then fails (and is retried by its
+    # caller) instead of hanging that request or background loop forever.
+    DB_COMMAND_TIMEOUT_SECONDS: float = 15.0
+
+    # Diagnostic (app/core/loop_watchdog.py): warn when the event loop was
+    # blocked this long -- i.e. this whole process stopped running.
+    LOOP_WATCHDOG_ENABLED: bool = True
+    LOOP_WATCHDOG_INTERVAL_SECONDS: float = 0.5
+    LOOP_WATCHDOG_WARN_SECONDS: float = 1.0
 
     # Own Groq client (app/services/groq_service.py) -- generates fresh
     # questions to top up the shared question pool when it runs short for a
@@ -70,6 +84,11 @@ class Settings(BaseSettings):
     # app/services/matchmaking_service.py for the key schema and atomic-claim
     # design.
     REDIS_URL: str = "redis://localhost:6379/0"
+    # A stalled Redis command/connect fails after this instead of hanging.
+    # Pub/sub's blocking listen() is exempt (redis-py waits indefinitely
+    # there regardless), so an idle match channel is never cut off.
+    REDIS_SOCKET_TIMEOUT_SECONDS: float = 5.0
+    REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS: float = 5.0
 
     # Rating-window widening by wait time -- a match requires
     # abs(rating_diff) <= min(window(A's wait), window(B's wait)). Tier 4
@@ -99,25 +118,39 @@ class Settings(BaseSettings):
     BATTLE_PRESENCE_TTL_SECONDS: int = 60
 
     # ── Competitive Battle System: battle engine ───────────────────────────
-    # Lockstep gameplay: both players see the SAME question at the SAME
-    # time, derived purely from elapsed wall-clock time since
-    # match.started_at (see app/services/battle_gameplay_service.py's
-    # _current_question_order) -- BATTLE_QUESTION_TIME_LIMIT_SECONDS is each
-    # question's fixed window; the match completes once
-    # BATTLE_QUESTION_COUNT * BATTLE_QUESTION_TIME_LIMIT_SECONDS total
-    # elapses, regardless of how many questions either player actually
-    # answered (an unanswered question when its window closes just counts
-    # as unanswered -- see _ensure_match_progressed).
+    # Self-paced gameplay: both players get the SAME questions in the SAME
+    # order, each moving on with Next/Skip at their own pace, no per-question
+    # time limit. The whole match lasts BATTLE_MATCH_DURATION_SECONDS from
+    # match.started_at, or ends earlier once both players have finished every
+    # question (see battle_gameplay_service._ensure_match_progressed).
     BATTLE_QUESTION_COUNT: int = 10
-    BATTLE_QUESTION_TIME_LIMIT_SECONDS: float = 30.0
-    # Both players' answers lock, get graded, and are revealed together
-    # during the last N seconds of each question's window -- the answerable
-    # window is BATTLE_QUESTION_TIME_LIMIT_SECONDS - BATTLE_ANSWER_REVEAL_
-    # SECONDS (25s by default), computed inline wherever needed rather than
-    # stored as its own setting so the two can't drift out of sync. See
-    # battle_gameplay_service._grade_and_reveal_question and battle_ws.py's
-    # _progression_timer.
-    BATTLE_ANSWER_REVEAL_SECONDS: float = 5.0
+    BATTLE_MATCH_DURATION_SECONDS: float = 300.0
+    # How long after the visible clock hits 0:00 the server still accepts an
+    # answer, on top of the player's own network allowance below. 0 = the
+    # cutoff is 0:00 as THAT player's phone saw it: an answer sent before
+    # their countdown ran out is accepted even though it arrives a round trip
+    # later; anything later -- including a save still in progress -- is
+    # refused ("Time's up") and the match ends without it.
+    BATTLE_ANSWER_LATE_GRACE_SECONDS: float = 0.0
+    # Network allowance: this player's fastest recently measured round trip
+    # (server ping -> client pong over the match WebSocket), capped here so a
+    # client that delays its pongs can never gain more than this. Used twice:
+    #   - speed bonus: a question's hidden timer runs from when the server
+    #     sent it to when the answer arrived, minus this, so time spent on the
+    #     network isn't counted as thinking time;
+    #   - the 0:00 cutoff: the phone's countdown runs about this far behind
+    #     the server's, so an answer is accepted until 0:00 + this.
+    # The match itself is finalized only once the largest possible allowance
+    # has passed (see battle_gameplay_service.answers_close_at). 2s covers
+    # slow mobile networks; the cost is that a deliberately slow-ponging
+    # client could gain at most this much per answer.
+    BATTLE_NETWORK_ALLOWANCE_MAX_SECONDS: float = 2.0
+    # Round-trip measurement: first ping this long after a socket connects,
+    # then every BATTLE_RTT_PING_INTERVAL_SECONDS; the allowance is the
+    # fastest of the last BATTLE_RTT_SAMPLE_COUNT samples.
+    BATTLE_RTT_FIRST_PING_DELAY_SECONDS: float = 1.0
+    BATTLE_RTT_PING_INTERVAL_SECONDS: float = 5.0
+    BATTLE_RTT_SAMPLE_COUNT: int = 5
     # grade has no persistence anywhere (not a Question column, prompt-text-
     # only for Groq).
     BATTLE_QUESTION_GRADE_DEFAULT: int = 10
@@ -133,12 +166,39 @@ class Settings(BaseSettings):
     BATTLE_POOL_MIN_SIZE: int = 20
     BATTLE_POOL_TARGET_SIZE: int = 60
     BATTLE_POOL_TOPUP_MAX_BATCH: int = 20
+    # Top up every allowed subject's thin buckets once at startup, so a
+    # subject nobody has battled in yet already has questions (see
+    # battle_question_service.warm_up_pools).
+    BATTLE_POOL_WARMUP_ON_STARTUP: bool = True
     # Hard cap per (subject, difficulty) for "grow" top-ups -- the extra
     # batches requested once a match had to serve already-seen questions
     # because the pair had exhausted the never-seen pool. Keeps regular
     # players from memorising a fixed ~60-question set, while bounding the
     # Groq spend.
     BATTLE_POOL_MAX_SIZE: int = 300
+
+    # ── AI-first question generation (battle_question_service) ────────────
+    # When a match starts, ask the AI for fresh questions first -- checked
+    # against everything either player has already been shown in a battle,
+    # and against the pool -- and only fill whatever it couldn't provide in
+    # time from the pool (never-seen first). Off = pool only, as before.
+    BATTLE_AI_FIRST_ENABLED: bool = True
+    # How long a match start waits for the AI before falling back to the
+    # pool for the rest. Players see the "preparing" screen meanwhile.
+    BATTLE_AI_GENERATION_TIMEOUT_SECONDS: float = 8.0
+    # Ask for this much more than needed (rounded up, at least 1 per tier),
+    # so questions dropped as repeats/near-duplicates still leave enough.
+    BATTLE_AI_OVERGENERATE_RATIO: float = 0.4
+    # Matches generating at once per process; any match beyond this just
+    # uses the pool, so a burst of matches can't run into Groq's rate limit.
+    BATTLE_AI_MAX_CONCURRENT_GENERATIONS: int = 4
+    # How many of the two players' most recently seen questions are listed
+    # in the AI prompt as "don't repeat these" (every seen question is still
+    # filtered out afterwards either way).
+    BATTLE_AI_AVOID_RECENT_QUESTIONS: int = 60
+    # The lessons the two players have seen most, passed to the AI as
+    # "prefer other lessons" -- spreads matches across the syllabus.
+    BATTLE_AI_AVOID_TOP_LESSONS: int = 5
 
     # Base correct score -- wrong answer is always 0, never negative.
     BATTLE_SCORE_BASE_CORRECT: int = 100
@@ -154,8 +214,9 @@ class Settings(BaseSettings):
     BATTLE_SPEED_BONUS_TIER4_POINTS: int = 0
 
     # Streak bonus tiers (min consecutive-correct streak -> points), capped
-    # at tier4 -- no infinite compounding. Wrong/skipped answer resets the
-    # streak (see battle_gameplay_service._streak_before).
+    # at tier4 -- no infinite compounding. A wrong or skipped answer resets
+    # the streak (see battle_gameplay_service._streak_before). Worked out as
+    # each answer is saved but, like every score, only shown at the end.
     BATTLE_STREAK_BONUS_TIER1_MIN_STREAK: int = 2
     BATTLE_STREAK_BONUS_TIER1_POINTS: int = 5
     BATTLE_STREAK_BONUS_TIER2_MIN_STREAK: int = 3
@@ -224,6 +285,23 @@ class Settings(BaseSettings):
     # How often a connected client's progression timer polls while a match
     # is still "waiting" for both sides to ready up.
     BATTLE_WS_WAITING_POLL_INTERVAL_SECONDS: float = 1.0
+    # While "active", the progression timer re-checks the match at least this
+    # often instead of sleeping straight through to the end of the match
+    # clock -- one cheap read, and it notices a match that ended some other
+    # way (both players finished, a forfeit) even if its stop signal is missed.
+    BATTLE_WS_ACTIVE_POLL_INTERVAL_SECONDS: float = 5.0
+    # Longest a single Next/Skip save may take over the WebSocket before it's
+    # abandoned and reported as "Couldn't save your answer — retrying." --
+    # the client resends it, and the save is idempotent (compare-and-swap on
+    # current_question_index), so a stalled DB fails instead of hanging the
+    # player's connection until the network stack gives up. Covers the save
+    # up to its commit only. Sized for ~10 sequential queries to a distant DB
+    # (each a full network round trip) -- keep it above the slowest normal save.
+    BATTLE_ANSWER_SAVE_TIMEOUT_SECONDS: float = 20.0
+    # Diagnostic: a Next/Skip save slower than this (or one that fails/times
+    # out) logs how long each of its steps took -- shows which DB round trip
+    # stalled. See battle_gameplay_service._SaveSteps.
+    BATTLE_SLOW_SAVE_LOG_SECONDS: float = 3.0
     # Safety-net TTL for the per-(match,user) connection-generation counter
     # (see battle_gameplay_service.bump_connection_generation) -- generous,
     # well past any realistic match duration, not the primary cleanup path.
@@ -257,8 +335,8 @@ class Settings(BaseSettings):
     # or an open WS connection, so a match nobody is connected to just sits
     # forever otherwise -- and its Redis "in_match" pointer (no TTL) with it,
     # locking the abandoning player out of queueing again until this reaper
-    # runs. Set to 2x any real match's total duration (BATTLE_QUESTION_COUNT
-    # * BATTLE_QUESTION_TIME_LIMIT_SECONDS is 300s by default) rather than a
+    # runs. Set well past any real match's total duration
+    # (BATTLE_MATCH_DURATION_SECONDS, 300s by default) rather than a
     # much larger arbitrary buffer: a match genuinely still being played
     # always transitions out of "active" via _ensure_match_progressed the
     # moment that budget elapses and anyone touches it, so this can never
@@ -266,9 +344,9 @@ class Settings(BaseSettings):
     # long an abandoned one blocks its players.
     BATTLE_ACTIVE_MATCH_REAP_AFTER_SECONDS: float = 600.0
     # An "active" match nobody is connected to anymore once its whole time
-    # budget (BATTLE_QUESTION_COUNT * BATTLE_QUESTION_TIME_LIMIT_SECONDS) plus
-    # this buffer has passed gets settled by the reaper: remaining questions
-    # graded, result and rating changes applied as if someone had been there
+    # budget (BATTLE_MATCH_DURATION_SECONDS + BATTLE_ANSWER_LATE_GRACE_SECONDS)
+    # plus this buffer has passed gets settled by the reaper: result and
+    # rating changes applied as if someone had been there
     # to see it end -- so a winner whose opponent (and then they themselves)
     # closed the app still gets the win. Only a match where neither player
     # ever answered anything is cancelled as abandoned instead.
