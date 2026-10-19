@@ -186,6 +186,7 @@ async def generate_questions(
     preferred_lessons: list[str] | None = None,
     adaptive_context: str | None = None,
     telemetry: dict | None = None,
+    focus: str | None = None,
 ) -> list[dict]:
     # Asks Groq for `question_count` MCQs and hands back a validated list of
     # dicts (question/options/correct_answer/explanation/lesson). If `lesson`
@@ -288,6 +289,13 @@ QUALITY RULES:
             )
 
         adaptive_context_block = f"\n\nStudent context: {adaptive_context}\n" if adaptive_context else ""
+        # Several sets of one quiz are written at the same time (battle_question_service); each gets its own focus
+        # so they don't come back with overlapping questions.
+        focus_block = (
+            f"\n\nFOCUS FOR THIS SET: other sets of the same quiz are being written at the same time, each with "
+            f"its own focus -- keep to this one so they don't overlap:\n{focus}\n"
+            if focus else ""
+        )
 
         user_prompt = (
             f"[Request ID: {seed_context}]\n\n"
@@ -297,7 +305,8 @@ QUALITY RULES:
             f"{exclusion_block}"
             f"{avoid_lessons_block}"
             f"{preferred_lessons_block}"
-            f"{adaptive_context_block}\n"
+            f"{adaptive_context_block}"
+            f"{focus_block}\n"
             f"Requirements:\n"
             f"- Do NOT focus on a single lesson. EACH question must come from a DIFFERENT, "
             f"randomly chosen lesson/topic within the full '{subject}' syllabus for this grade.\n"

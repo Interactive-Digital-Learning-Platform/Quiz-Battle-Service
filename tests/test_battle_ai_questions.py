@@ -307,3 +307,63 @@ async def test_a_late_batch_lands_in_the_pool_without_duplicates(db_session, mon
     texts = [q for q in (await db_session.execute(select(Question.question))).scalars()]
     assert _ai_item(0)["question"] in texts and _ai_item(1)["question"] in texts
     assert texts.count(existing.question) == 1  # the copy of a pool question was skipped
+
+
+def test_maths_questions_differing_only_in_numbers_are_not_copies():
+    from app.services.text_similarity import is_near_duplicate
+
+    assert not is_near_duplicate("Find the value of x if 3x + 5 = 20.", ["Find the value of x if 2x - 7 = 15."])
+    assert not is_near_duplicate("Simplify x^2 + 4x when x = 3", ["Simplify 3y^2 - 2y when y = 5"])
+    # Same expression, only the substituted value changed: still the same exercise -- counted as a copy.
+    assert is_near_duplicate("Simplify x^2 + 4x when x = 3", ["Simplify x^2 + 4x when x = 5"])
+    # A real copy is still caught -- with or without the final punctuation, and a reworded one too.
+    assert is_near_duplicate("Find the value of x if 3x + 5 = 20", ["Find the value of x if 3x + 5 = 20."])
+    assert is_near_duplicate(
+        "What is the main product of photosynthesis in plants?", ["What is the main product of photosynthesis?"],
+    )
+
+
+def test_each_parallel_batch_gets_its_own_style_and_lessons():
+    lessons = ["Algebra", "Geometry", "Fractions", "Statistics", "Probability", "Sets"]
+    focuses = [battle_question_service._batch_focus(i, 3, lessons) for i in range(3)]
+
+    assert len(set(focuses)) == 3
+    shares = [set(f.split("lessons: ")[1].rstrip(".").split(", ")) for f in focuses]
+    assert not (shares[0] & shares[1]) and not (shares[1] & shares[2]) and not (shares[0] & shares[2])
+    assert battle_question_service._batch_focus(0, 3, []).startswith("Question style:")  # no lessons known: style only
+
+
+async def test_batches_are_sent_their_focus(db_session, ai_on, monkeypatch):
+    a, b = await _users(db_session)
+    db_session.add_all([_pool_question(i) for i in range(3)])  # gives the pool a lesson ("Algebra") to share out
+    await db_session.commit()
+    mock = _fake_ai(monkeypatch, lambda d, n: [_ai_item(100 + i) for i in range(n)])
+
+    await select_battle_questions(db_session, subject="Mathematics", tier_counts={"medium": 7}, participant_user_ids=(a, b))
+
+    focuses = [c.kwargs["focus"] for c in mock.await_args_list]
+    assert len(focuses) == 3 and len(set(focuses)) == 3
+    assert any("Algebra" in f for f in focuses)
+
+
+async def test_the_focus_is_written_into_the_ai_prompt(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.services import groq_service
+
+    sent = {}
+
+    async def fake_completion(*, messages, **_kwargs):
+        sent["prompt"] = messages[-1]["content"]
+        payload = '{"questions": [{"question": "Q?", "options": ["A", "B", "C", "D"], "correct_answer": "A", ' \
+                  '"explanation": "", "lesson": "Algebra"}]}'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=payload))])
+
+    monkeypatch.setattr(groq_service, "_create_chat_completion_with_retry", fake_completion)
+
+    await groq_service.generate_questions(
+        grade=10, subject="Mathematics", difficulty="easy", question_count=1,
+        focus="Question style: recall of key facts. Draw the questions from these lessons: Algebra.",
+    )
+
+    assert "FOCUS FOR THIS SET" in sent["prompt"] and "lessons: Algebra" in sent["prompt"]

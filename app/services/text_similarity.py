@@ -4,6 +4,8 @@
 # no longer sits alongside the private internals of a larger module. Keep in
 # sync by hand if the upstream logic changes.
 
+import re
+
 _STOP_WORDS = frozenset(
     {
         "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be",
@@ -14,10 +16,19 @@ _STOP_WORDS = frozenset(
 )
 
 
+# A word, number or math term: "energy", "20", "3.5", "2x", "x^2".
+_TOKEN = re.compile(r"[a-z0-9]+(?:[.^][a-z0-9]+)*")
+
+
 def significant_words(text: str) -> frozenset[str]:
-    return frozenset(
-        w for w in text.lower().split() if w.isalpha() and w not in _STOP_WORDS and len(w) > 2
-    )
+    """The words that tell two questions apart: anything containing a digit (numbers, "2x", "x^2", "3.5") plus
+    words of 3+ letters that aren't stop words. Numbers and math terms count -- for maths they ARE the question:
+    "Find x if 3x + 5 = 20" and "Find x if 2x - 7 = 15" share every ordinary word but are different questions."""
+    words = set()
+    for token in _TOKEN.findall(text.lower()):
+        if any(ch.isdigit() for ch in token) or (len(token) > 2 and token not in _STOP_WORDS):
+            words.add(token)
+    return frozenset(words)
 
 
 def jaccard_similarity(a: str, b: str) -> float:

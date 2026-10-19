@@ -395,6 +395,28 @@ def _ai_slots() -> asyncio.Semaphore:
     return _ai_generation_slots
 
 
+# One per parallel AI batch, in turn -- a different kind of question for each, so batches written at the same
+# moment with otherwise identical instructions don't come back with near-identical questions.
+_BATCH_STYLES = (
+    "recall of key facts, terms and definitions",
+    "applying a concept, rule or formula to a new example",
+    "real-world scenarios set in everyday Sri Lankan life",
+    "cause-and-effect and 'why' reasoning",
+    "comparing or contrasting two related ideas",
+)
+# Lessons handed to each batch as its share of the subject (when the pool knows the subject's lessons).
+_LESSONS_PER_BATCH = 3
+
+
+def _batch_focus(index: int, batches: int, lessons: list[str]) -> str:
+    """Batch `index` of `batches`: its own question style, plus its own share of `lessons` (none overlap)."""
+    focus = f"Question style: {_BATCH_STYLES[index % len(_BATCH_STYLES)]}."
+    share = lessons[index::batches][:_LESSONS_PER_BATCH]
+    if share:
+        focus += f" Draw the questions from these lessons: {', '.join(share)}."
+    return focus
+
+
 def _batch_sizes(total: int, batch_size: int) -> list[int]:
     """`total` split into as few near-equal batches of at most `batch_size` as possible: 10 by 4 -> [4, 3, 3]."""
     batches = max(1, math.ceil(total / max(1, batch_size)))
@@ -404,6 +426,7 @@ def _batch_sizes(total: int, batch_size: int) -> list[int]:
 
 async def _generate_ai_candidates(
     *, subject: str, tier_counts: dict[str, int], avoid_texts: list[str], avoid_lessons: list[str],
+    focus_lessons: list[str] | None = None,
 ) -> tuple[dict[str, list[dict]], dict]:
     """Asks the AI for each tier's questions plus a few spares (BATTLE_AI_OVERGENERATE_RATIO), split into
     batches of at most BATTLE_AI_BATCH_SIZE, all requested at once. Whatever has come back within
@@ -415,15 +438,19 @@ async def _generate_ai_candidates(
         for difficulty, count in tier_counts.items() if count > 0
     }
     stats = {"requested": sum(wanted.values()), "invalid": 0, "failed_batches": 0, "late_batches": 0}
+    plan = [
+        (difficulty, size)
+        for difficulty, n in wanted.items()
+        for size in _batch_sizes(n, settings.BATTLE_AI_BATCH_SIZE)
+    ]
     calls: list[tuple[str, dict, asyncio.Task]] = []
-    for difficulty, n in wanted.items():
-        for size in _batch_sizes(n, settings.BATTLE_AI_BATCH_SIZE):
-            telemetry: dict = {}
-            calls.append((difficulty, telemetry, asyncio.create_task(generate_questions(
-                grade=settings.BATTLE_QUESTION_GRADE_DEFAULT, subject=subject, difficulty=difficulty,
-                question_count=size, existing_questions=avoid_texts, avoid_lessons=avoid_lessons,
-                telemetry=telemetry,
-            ))))
+    for index, (difficulty, size) in enumerate(plan):
+        telemetry: dict = {}
+        calls.append((difficulty, telemetry, asyncio.create_task(generate_questions(
+            grade=settings.BATTLE_QUESTION_GRADE_DEFAULT, subject=subject, difficulty=difficulty,
+            question_count=size, existing_questions=avoid_texts, avoid_lessons=avoid_lessons,
+            telemetry=telemetry, focus=_batch_focus(index, len(plan), focus_lessons or []),
+        ))))
     _done, pending = await asyncio.wait(
         [task for _, _, task in calls], timeout=settings.BATTLE_AI_GENERATION_TIMEOUT_SECONDS,
     )
@@ -520,10 +547,19 @@ async def _ai_first_questions(
         lesson_counts[lesson] = lesson_counts.get(lesson, 0) + 1
     avoid_lessons = sorted(lesson_counts, key=lambda lesson: -lesson_counts[lesson])[: settings.BATTLE_AI_AVOID_TOP_LESSONS]
 
+    # The subject's lessons the pool knows of, minus the ones these players have seen most -- shared out between
+    # the parallel batches (_batch_focus) so each covers different ground.
+    pool_lessons = (
+        await db.execute(select(Question.lesson).where(Question.subject == subject).distinct().limit(60))
+    ).scalars().all()
+    focus_lessons = [lesson for lesson in pool_lessons if lesson and lesson not in avoid_lessons]
+    random.shuffle(focus_lessons)
+
     started = time.monotonic()
     async with slots:
         candidates, stats = await _generate_ai_candidates(
             subject=subject, tier_counts=tier_counts, avoid_texts=avoid_texts, avoid_lessons=avoid_lessons,
+            focus_lessons=focus_lessons,
         )
 
     pool_rows = (
