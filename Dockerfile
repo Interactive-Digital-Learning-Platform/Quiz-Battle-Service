@@ -1,52 +1,46 @@
-# ── Build Stage ───────────────────────────────────────────────────────────────
-# Use official slim Python 3.12 image to keep the image lightweight
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
 
-# Pull the uv binary from Astral's distroless image rather than installing it
-# via pip — keeps it out of the final dependency graph entirely.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+FROM python:3.12-slim-bookworm AS builder
+COPY --from=ghcr.io/astral-sh/uv:0.11.1 /uv /usr/local/bin/uv
 
-# Set environment variables to prevent Python from writing .pyc files
-# and to ensure stdout/stderr is unbuffered (important for Docker logging)
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project
+
+FROM python:3.12-slim-bookworm AS runtime
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
+    PATH="/opt/venv/bin:$PATH" \
+    ENVIRONMENT=production \
+    RUN_MIGRATIONS=true \
+    WEB_CONCURRENCY=1
 
-# Create a non-root user for security
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+RUN groupadd --system --gid 10001 appgroup \
+    && useradd --system --uid 10001 --gid appgroup --no-create-home appuser
 
-# Set the working directory inside the container
 WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+COPY --chown=appuser:appgroup app ./app
+COPY --chown=appuser:appgroup alembic ./alembic
+COPY --chown=appuser:appgroup alembic.ini ./
 
-# ── Install Dependencies ───────────────────────────────────────────────────────
-# Copy only the lockfile + project metadata first to leverage Docker layer
-# caching — this layer only rebuilds when dependencies actually change.
-# --no-dev skips pytest/pytest-asyncio, which the runtime image doesn't need.
-COPY pyproject.toml uv.lock .
-RUN uv sync --frozen --no-dev
-
-# ── Copy Application Code ──────────────────────────────────────────────────────
-COPY . .
-
-# Change ownership of all files to the non-root user
-RUN chown -R appuser:appgroup /app
-
-# Switch to non-root user
 USER appuser
 
-# Put the venv uv created ahead of the system Python on PATH
-ENV PATH="/app/.venv/bin:$PATH"
-
-# ── Runtime ────────────────────────────────────────────────────────────────────
-# Expose the port that uvicorn will listen on. The host-side mapping (this
-# service runs on host port 8005 behind the gateway) happens in
-# docker-compose.yml / the run command, not here.
+# Nginx connects to host port 8005; publish with 8005:8000.
 EXPOSE 8000
 
-# Start FastAPI with uvicorn
-# --host 0.0.0.0 makes the server accessible from outside the container.
-# Worker count comes from WEB_CONCURRENCY (defaults to 1) rather than a fixed
-# number baked into the image, so it can be tuned per-deployment without a
-# rebuild.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY:-1}"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close()"]
+
+# Applies pending alembic migrations first (this service's own version table, alembic_version_quiz_online):
+# create_all at startup only creates missing tables, never the new columns a migration adds. Set
+# RUN_MIGRATIONS=false when running several copies and run `alembic upgrade head` once yourself.
+# `exec` hands the shell's PID to Uvicorn, so stop signals still reach it directly; Uvicorn reads WEB_CONCURRENCY.
+CMD ["sh", "-c", "if [ \"$RUN_MIGRATIONS\" = \"true\" ]; then alembic upgrade head; fi && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]

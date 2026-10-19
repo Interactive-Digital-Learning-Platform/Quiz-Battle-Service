@@ -594,6 +594,11 @@ async def start_matchmaking_sweep_loop() -> None:
 _TERMINAL_MATCH_STATUSES = ("completed", "cancelled")
 
 
+def _reconcile_missing_key(user_id: int, match_id: int) -> str:
+    # Set when the in_match reconciler first can't find the match a user points at; see run_in_match_reconcile_once.
+    return f"battle:reconcile_missing:{user_id}:{match_id}"
+
+
 async def run_in_match_reconcile_once(db: AsyncSession, redis: Redis) -> int:
     match_id_by_user: dict[int, int] = {}
     async for key in redis.scan_iter(match=f"{_USER_STATE_PREFIX}*"):
@@ -617,10 +622,33 @@ async def run_in_match_reconcile_once(db: AsyncSession, redis: Redis) -> int:
     healed = 0
     for user_id, match_id in match_id_by_user.items():
         match_status = status_by_match_id.get(match_id)
-        # A missing match row is just as terminal as an explicitly
-        # completed/cancelled one -- either way there's nothing left for
-        # this user_id to be "in_match" about.
-        if match_status is None or match_status in _TERMINAL_MATCH_STATUSES:
+        if match_status is None:
+            # Not found. A match row is committed before Redis ever points at it (_create_match ->
+            # _finalize_matched_state), so this shouldn't happen -- and releasing on a single miss would free two
+            # players from a match they may well still be playing (e.g. a moment of DB trouble, or another
+            # process on a different database sharing this Redis). Only release once it's still missing on the
+            # next tick.
+            missing_key = _reconcile_missing_key(user_id, match_id)
+            if not await redis.exists(missing_key):
+                await redis.set(
+                    missing_key, "1", ex=int(settings.BATTLE_IN_MATCH_RECONCILE_INTERVAL_SECONDS * 3),
+                )
+                logger.warning(
+                    "in_match reconcile: user_id=%d points at match_id=%d, which this database doesn't have -- "
+                    "re-checking next tick before releasing.", user_id, match_id,
+                )
+                continue
+            await redis.delete(missing_key)
+            await release_match_state(redis, user_id=user_id)
+            logger.error(
+                "in_match reconcile: released user_id=%d -- match_id=%d still not found on a second check. If "
+                "that match is real, this process is connected to a different database than the one that "
+                "created it (check DATABASE_URL against the other services sharing this Redis).",
+                user_id, match_id,
+            )
+            healed += 1
+            continue
+        if match_status in _TERMINAL_MATCH_STATUSES:
             await release_match_state(redis, user_id=user_id)
             logger.warning(
                 "Reconciled stale in_match state -- user_id=%d pointed at match_id=%d "

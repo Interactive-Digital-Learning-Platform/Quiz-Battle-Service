@@ -67,6 +67,7 @@ os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TMP_DB_PATH}"
 os.environ["REDIS_URL"] = os.environ.get("BATTLE_VERIFY_REDIS_URL", "redis://localhost:6379/15")
 # No real Groq calls: matches use the pool this script seeds itself.
 os.environ["BATTLE_AI_FIRST_ENABLED"] = "false"
+os.environ["BATTLE_POOL_WARMUP_ON_STARTUP"] = "false"
 
 import httpx
 import uvicorn
@@ -115,7 +116,7 @@ async def _wait_for_server(client: httpx.AsyncClient, timeout: float = 10.0) -> 
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            r = await client.get(f"{BASE_URL}/docs")
+            r = await client.get(f"{BASE_URL}/health")
             if r.status_code == 200:
                 return
         except httpx.TransportError:
@@ -558,8 +559,8 @@ async def main() -> int:
     from app.core.security import get_current_user, get_current_user_ws
     from app.main import app
 
-    # settings.ENVIRONMENT=="development" (unchanged -- needed for /docs,
-    # used below as the readiness probe) drives app/main.py's logging setup
+    # In development (ENVIRONMENT from the local .env -- readiness is probed
+    # on /health, which works in any mode) app/main.py's logging setup goes
     # to root-level DEBUG, which floods this script's output with every
     # SQL statement and WS/HTTP frame. Quiet the noisy loggers specifically
     # rather than touching the app's own logging config.

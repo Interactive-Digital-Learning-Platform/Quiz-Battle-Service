@@ -173,17 +173,18 @@ async def test_multiple_tiers_pull_from_their_own_difficulty(db_session):
 
 
 async def test_near_duplicate_pool_questions_are_deduped(db_session):
-    # Two near-duplicate pool candidates (identical significant-word sets:
-    # {alpha, topic} for both) plus one truly distinct one -- only one of
-    # the near-duplicates should survive, so with count=2 requested and 2
-    # truly-distinct concepts available (alpha, bravo), selection succeeds
-    # with exactly one "alpha" variant plus "bravo".
+    # Two near-duplicate pool candidates (the second only adds one word:
+    # {alpha, topic, value} vs {alpha, topic, value, here} -- 75% the same)
+    # plus one truly distinct one -- only one of the near-duplicates should
+    # survive, so with count=2 requested and 2 truly-distinct concepts
+    # available (alpha, bravo), selection succeeds with exactly one "alpha"
+    # variant plus "bravo".
     user_a = await _make_user(db_session, "user-a")
     user_b = await _make_user(db_session, "user-b")
     candidates = [
         Question(question="What is the alpha topic value?", options=["A", "B", "C", "D"], correct_answer="A", subject="Mathematics", lesson="Algebra", difficulty="medium"),
-        Question(question="What is the alpha topic amount?", options=["A", "B", "C", "D"], correct_answer="A", subject="Mathematics", lesson="Algebra", difficulty="medium"),
-        Question(question="What is the bravo topic value?", options=["A", "B", "C", "D"], correct_answer="A", subject="Mathematics", lesson="Algebra", difficulty="medium"),
+        Question(question="What is the alpha topic value here?", options=["A", "B", "C", "D"], correct_answer="A", subject="Mathematics", lesson="Algebra", difficulty="medium"),
+        Question(question="Name the bravo concept number.", options=["A", "B", "C", "D"], correct_answer="A", subject="Mathematics", lesson="Algebra", difficulty="medium"),
     ]
     db_session.add_all(candidates)
     await db_session.commit()
@@ -196,7 +197,7 @@ async def test_near_duplicate_pool_questions_are_deduped(db_session):
     # Only 2 distinct (non-duplicate) concepts exist across the whole pool.
     assert len(result) == 2
     texts = {q.question for q in result}
-    assert "What is the bravo topic value?" in texts
+    assert "Name the bravo concept number." in texts
     assert len([t for t in texts if t.startswith("What is the alpha")]) == 1
 
 

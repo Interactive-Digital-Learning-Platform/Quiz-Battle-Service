@@ -63,6 +63,9 @@ def _no_real_ai_questions(monkeypatch):
     # for the same reason as _no_real_pool_replenish above.
     monkeypatch.setattr(settings, "BATTLE_AI_FIRST_ENABLED", False)
     monkeypatch.setattr(battle_question_service, "_kickoff_ai_telemetry", lambda **k: None)
+    # A batch that misses the match start would be saved to the pool in the background on its own session --
+    # cancelled here instead (test_battle_ai_questions.py tests _save_late_ai_batch directly).
+    monkeypatch.setattr(battle_question_service, "_kickoff_late_ai_save", lambda *, subject, difficulty, task: task.cancel())
 
 
 @pytest.fixture(autouse=True)

@@ -648,10 +648,11 @@ async def test_a_second_activation_attempt_doesnt_announce_the_countdown_again(d
     with patch(
         "app.services.battle_gameplay_service.select_battle_questions", new=AsyncMock(return_value=questions),
     ), patch.object(battle_gameplay_service.ws_manager, "publish", new=AsyncMock()) as publish:
-        first = await battle_gameplay_service._finalize_activation(db_session, fake_redis, match=match)
-        second = await battle_gameplay_service._finalize_activation(db_session, fake_redis, match=match)
+        first, first_started = await battle_gameplay_service._finalize_activation(db_session, fake_redis, match=match)
+        second, second_started = await battle_gameplay_service._finalize_activation(db_session, fake_redis, match=match)
 
     assert first.status == second.status == "countdown"
+    assert (first_started, second_started) == (True, False)
     assert [c.kwargs["event"]["type"] for c in publish.await_args_list] == ["countdown_started"]
 
 

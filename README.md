@@ -35,6 +35,73 @@ Configure via environment variables (or `.env`, see `.env.example`):
 - `BATTLE_PRESENCE_TTL_SECONDS` (default `60`) — TTL for the online-presence
   heartbeat key (`battle:presence:{user_id}`, see below).
 
+## Docker deployment
+
+The production image uses Python 3.12, locked production dependencies, a
+non-root user, and one Uvicorn worker by default. It listens on container
+port **8000**, published on host port **8005** to match the existing Nginx
+upstream. No changes to `Deployment-Infrastructure` are required.
+
+Supply the required database, Groq, and Clerk settings through `.env` at
+runtime. Environment files and local virtual environments are excluded from
+the image. Run the image directly with Docker; no Compose file is required.
+
+Build the image (skip this if `quiz-battle-service:local` is already built):
+
+```sh
+docker build -t quiz-battle-service:local .
+```
+
+For an existing battle database, apply this service's migrations before
+starting the API. This command changes the configured shared database;
+the Personalized-Quiz-Service schema and the existing battle baseline
+tables must already exist. The initial battle migration adopts existing
+tables; it does not create them.
+
+```sh
+docker run --rm --env-file .env -e ENVIRONMENT=production \
+  -e AUTH_BYPASS=false quiz-battle-service:local alembic upgrade head
+```
+
+Start the API using an existing Redis instance exposed on host port 6379
+(for example, the one in Deployment-Infrastructure). That Redis instance
+must already be running. `host.docker.internal` reaches the host from the
+container; `localhost` inside the container would refer to the API itself.
+If using remote Redis, replace the `REDIS_URL` value below with its URL,
+or omit that flag if `.env` already contains the remote URL.
+
+```sh
+docker run -d --name quiz-battle-service \
+  --restart unless-stopped --stop-timeout 30 \
+  -p 8005:8000 \
+  --env-file .env \
+  --add-host host.docker.internal:host-gateway \
+  -e ENVIRONMENT=production \
+  -e AUTH_BYPASS=false \
+  -e WEB_CONCURRENCY=1 \
+  -e REDIS_URL=redis://host.docker.internal:6379/0 \
+  quiz-battle-service:local
+
+docker logs --tail 100 quiz-battle-service
+docker ps --filter name=quiz-battle-service
+curl --fail http://localhost:8005/health
+curl --fail http://localhost:8080/api/battle/health
+```
+
+The gateway check requires the existing Nginx gateway to be running. Its
+`/api/battle/` prefix is stripped before forwarding REST and WebSocket
+traffic to the service. A match WebSocket uses
+`/api/battle/api/v1/battle/match/{match_id}/ws?token=<clerk_jwt>`.
+
+The image health check polls `/health` for HTTP responsiveness; it does not
+continuously verify database or Redis availability. Startup itself requires
+both dependencies. Keep one worker initially: every worker runs startup
+queue cleanup and background loops. Uvicorn supports `WEB_CONCURRENCY` for
+future worker tuning after verifying that lifecycle with multiple workers.
+
+The multi-stage dependency build follows the
+[uv Docker integration guidance](https://docs.astral.sh/uv/guides/integration/docker/).
+
 ### Redis keys and TTL strategy
 
 All keys are prefixed `battle:`. Every TTL below is a *safety net*, not the

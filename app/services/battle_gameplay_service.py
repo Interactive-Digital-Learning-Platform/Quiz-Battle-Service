@@ -33,6 +33,7 @@ like Phase 3's original activation CAS did; whether one or both processes
 observe "both ready" in Redis doesn't matter, only one CAS ever wins.
 """
 import asyncio
+import contextlib
 import logging
 import math
 import random
@@ -110,6 +111,17 @@ def _connected_key(match_id: int) -> str:
 
 def _both_ready_at_key(match_id: int) -> str:
     return f"battle:both_ready_at:{match_id}"
+
+
+# How much longer than the AI wait the "activating" marker lives -- covers the DB work around question selection,
+# and still expires on its own if a process dies mid-activation.
+_ACTIVATING_MARKER_SLACK_SECONDS = 30
+
+
+def _activating_key(match_id: int) -> str:
+    # Set while a match is being started (its questions picked -- AI first, so up to
+    # BATTLE_AI_GENERATION_TIMEOUT_SECONDS); the stale-match reaper leaves such a match alone.
+    return f"battle:activating:{match_id}"
 
 
 def _disconnect_deadline_key(match_id: int, user_id: int) -> str:
@@ -223,18 +235,29 @@ async def _try_activate_if_ready_and_connected(
     if not (all_ids <= connected_ids):
         return match  # ready, but still waiting on a WS connection to confirm
 
-    return await _finalize_activation(db, redis, match=match)
+    match, _started_it = await _finalize_activation(db, redis, match=match)
+    return match
 
 
-async def _finalize_activation(db: AsyncSession, redis: Redis, *, match: BattleMatch) -> BattleMatch:
-    match, started_it = await _activate_countdown(db, match, redis)
+async def _finalize_activation(db: AsyncSession, redis: Redis, *, match: BattleMatch) -> tuple[BattleMatch, bool]:
+    """Starts a ready match: picks its questions and announces the countdown. Returns the match and whether THIS
+    call started it (False: another call already had)."""
+    activating_key = _activating_key(match.id)
+    await redis.set(
+        activating_key, "1", ex=int(settings.BATTLE_AI_GENERATION_TIMEOUT_SECONDS + _ACTIVATING_MARKER_SLACK_SECONDS),
+    )
+    try:
+        match, started_it = await _activate_countdown(db, match, redis)
+    finally:
+        with contextlib.suppress(Exception):
+            await redis.delete(activating_key)
     # Only the call that actually started the countdown announces it. Picking
     # questions can now take seconds (AI first), and a second trigger arriving
     # meanwhile (the other player's connect, the stale-match reaper's forced
     # activation) waits on the first and then finds it already done -- it
     # mustn't announce the countdown (or a cancellation) a second time.
     if not started_it:
-        return match
+        return match, False
     if match.status == "countdown":
         await ws_manager.publish(
             redis, match_id=match.id,
@@ -248,7 +271,7 @@ async def _finalize_activation(db: AsyncSession, redis: Redis, *, match: BattleM
             redis, match_id=match.id,
             event=MatchCancelledEvent(reason=match.cancel_reason).model_dump(mode="json"),
         )
-    return match
+    return match, True
 
 
 async def mark_ready(db: AsyncSession, redis: Redis, *, match_id: int, user_id: int) -> BattleMatch:
@@ -1537,11 +1560,14 @@ async def _force_activate_stalled_ready_matches(db: AsyncSession, redis: Redis, 
         if (datetime.now(UTC) - as_utc(both_ready_at)).total_seconds() < cutoff_seconds:
             continue
 
+        if await redis.exists(_activating_key(match_id)):
+            continue  # being started right now (questions still being picked) -- not stalled
         match = await get_match_row(db, match_id)
         if match is None or match.status != "waiting":
             continue  # already handled (activated/cancelled) by another process/tick
-        await _finalize_activation(db, redis, match=match)
-        forced_ids.append(match_id)
+        match, started_it = await _finalize_activation(db, redis, match=match)
+        if started_it:  # otherwise the normal path had already started it -- nothing was forced
+            forced_ids.append(match_id)
 
     if forced_ids:
         logger.warning(

@@ -419,19 +419,35 @@ async def test_reconcile_heals_in_match_state_for_cancelled_match(db_session, fa
     assert await fake_redis.exists(matchmaking_service._user_state_key(user.id)) == 0
 
 
-async def test_reconcile_heals_in_match_state_for_nonexistent_match(db_session, fake_redis):
-    # Defensive: a match_id that no longer resolves to any row at all is
-    # just as terminal as an explicitly completed/cancelled one.
+async def test_reconcile_releases_a_nonexistent_match_only_on_the_second_check(db_session, fake_redis):
+    # A match row is committed before Redis points at it, so "not found" is suspicious (a moment of DB trouble,
+    # or a process on a different database sharing this Redis) -- releasing on one miss could free two players
+    # from a match they're still playing. Still missing on the next tick: then it's released.
     user = await _make_user(db_session, TEST_CLERK_ID)
-    await fake_redis.hset(
-        matchmaking_service._user_state_key(user.id),
-        mapping={"state": "in_match", "match_id": "999999"},
-    )
+    key = matchmaking_service._user_state_key(user.id)
+    await fake_redis.hset(key, mapping={"state": "in_match", "match_id": "999999"})
 
-    healed = await matchmaking_service.run_in_match_reconcile_once(db_session, fake_redis)
+    first = await matchmaking_service.run_in_match_reconcile_once(db_session, fake_redis)
+    assert first == 0
+    assert await fake_redis.exists(key) == 1
 
-    assert healed == 1
-    assert await fake_redis.exists(matchmaking_service._user_state_key(user.id)) == 0
+    second = await matchmaking_service.run_in_match_reconcile_once(db_session, fake_redis)
+    assert second == 1
+    assert await fake_redis.exists(key) == 0
+
+
+async def test_reconcile_keeps_a_match_found_again_after_one_miss(db_session, fake_redis):
+    user_a = await _make_user(db_session, TEST_CLERK_ID)
+    match = BattleMatch(subject="Mathematics", status="active", difficulty="Mostly Medium")
+    db_session.add(match)
+    await db_session.commit()
+    key = matchmaking_service._user_state_key(user_a.id)
+    await fake_redis.hset(key, mapping={"state": "in_match", "match_id": str(match.id)})
+    # As if the previous tick had failed to find it.
+    await fake_redis.set(matchmaking_service._reconcile_missing_key(user_a.id, match.id), "1")
+
+    assert await matchmaking_service.run_in_match_reconcile_once(db_session, fake_redis) == 0
+    assert await fake_redis.exists(key) == 1
 
 
 async def test_reconcile_leaves_genuinely_active_match_untouched(db_session, fake_redis):
