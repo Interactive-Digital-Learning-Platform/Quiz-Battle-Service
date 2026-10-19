@@ -286,6 +286,43 @@ async def test_reaper_force_activates_when_both_ready_but_never_connected(db_ses
     assert match.started_at is not None
 
 
+async def test_reaper_leaves_a_match_alone_while_it_is_being_started(db_session, fake_redis, monkeypatch):
+    # Picking questions (AI first) can take seconds: the match is still "waiting" meanwhile, but it isn't
+    # stalled -- the reaper must not try to start it too, or report it as force-activated.
+    from app.core.config import settings as app_settings
+    monkeypatch.setattr(app_settings, "BATTLE_CONNECTION_READY_TIMEOUT_SECONDS", 0.0)
+
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(db_session, user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000)
+    await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_a.id)
+    await battle_gameplay_service.mark_ready(db_session, fake_redis, match_id=match.id, user_id=user_b.id)
+    await fake_redis.set(battle_gameplay_service._activating_key(match.id), "1")
+
+    select_questions = AsyncMock()
+    with patch("app.services.battle_gameplay_service.select_battle_questions", new=select_questions):
+        forced = await battle_gameplay_service.run_stale_match_reap_once(db_session, fake_redis)
+
+    assert forced == 0
+    select_questions.assert_not_awaited()
+    assert (await battle_gameplay_service.get_match_row(db_session, match.id)).status == "waiting"
+
+
+async def test_activation_clears_its_activating_marker(db_session, fake_redis):
+    user_a = await _make_user(db_session, "user-a")
+    user_b = await _make_user(db_session, "user-b")
+    match = await _create_waiting_match(db_session, user_a_id=user_a.id, rating_a=1000, user_b_id=user_b.id, rating_b=1000)
+    questions = _fixed_questions()
+    db_session.add_all(questions)
+    await db_session.flush()
+
+    with patch("app.services.battle_gameplay_service.select_battle_questions", new=AsyncMock(return_value=questions)):
+        _, started = await battle_gameplay_service._finalize_activation(db_session, fake_redis, match=match)
+
+    assert started is True
+    assert await fake_redis.exists(battle_gameplay_service._activating_key(match.id)) == 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # forfeit_match
 # ─────────────────────────────────────────────────────────────────────────────

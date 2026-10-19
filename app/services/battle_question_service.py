@@ -395,50 +395,104 @@ def _ai_slots() -> asyncio.Semaphore:
     return _ai_generation_slots
 
 
+def _batch_sizes(total: int, batch_size: int) -> list[int]:
+    """`total` split into as few near-equal batches of at most `batch_size` as possible: 10 by 4 -> [4, 3, 3]."""
+    batches = max(1, math.ceil(total / max(1, batch_size)))
+    base, extra = divmod(total, batches)
+    return [base + 1 if i < extra else base for i in range(batches)]
+
+
 async def _generate_ai_candidates(
     *, subject: str, tier_counts: dict[str, int], avoid_texts: list[str], avoid_lessons: list[str],
 ) -> tuple[dict[str, list[dict]], dict]:
-    """One AI request per difficulty tier, all at once, each asking for a
-    few more than the tier needs (BATTLE_AI_OVERGENERATE_RATIO). Whatever
-    has come back within BATTLE_AI_GENERATION_TIMEOUT_SECONDS is used; the
-    rest is cancelled. A failed or late tier just comes back empty -- the
-    pool covers it. Returns candidates per difficulty plus counters for
-    telemetry."""
+    """Asks the AI for each tier's questions plus a few spares (BATTLE_AI_OVERGENERATE_RATIO), split into
+    batches of at most BATTLE_AI_BATCH_SIZE, all requested at once. Whatever has come back within
+    BATTLE_AI_GENERATION_TIMEOUT_SECONDS is used. A batch still running then is left to finish in the background
+    and lands in the pool for later matches (_kickoff_late_ai_save); a failed batch is just skipped -- the pool
+    covers the shortfall. Returns candidates per difficulty plus counters for telemetry."""
     wanted = {
         difficulty: count + max(1, math.ceil(count * settings.BATTLE_AI_OVERGENERATE_RATIO))
         for difficulty, count in tier_counts.items() if count > 0
     }
-    stats = {"requested": sum(wanted.values()), "invalid": 0, "failed_tiers": 0, "timed_out_tiers": 0}
-    telemetry_by_tier = {difficulty: {} for difficulty in wanted}
-    tasks = {
-        difficulty: asyncio.create_task(generate_questions(
-            grade=settings.BATTLE_QUESTION_GRADE_DEFAULT, subject=subject, difficulty=difficulty,
-            question_count=n, existing_questions=avoid_texts, avoid_lessons=avoid_lessons,
-            telemetry=telemetry_by_tier[difficulty],
-        ))
-        for difficulty, n in wanted.items()
-    }
-    _done, pending = await asyncio.wait(tasks.values(), timeout=settings.BATTLE_AI_GENERATION_TIMEOUT_SECONDS)
-    for task in pending:
-        task.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    stats = {"requested": sum(wanted.values()), "invalid": 0, "failed_batches": 0, "late_batches": 0}
+    calls: list[tuple[str, dict, asyncio.Task]] = []
+    for difficulty, n in wanted.items():
+        for size in _batch_sizes(n, settings.BATTLE_AI_BATCH_SIZE):
+            telemetry: dict = {}
+            calls.append((difficulty, telemetry, asyncio.create_task(generate_questions(
+                grade=settings.BATTLE_QUESTION_GRADE_DEFAULT, subject=subject, difficulty=difficulty,
+                question_count=size, existing_questions=avoid_texts, avoid_lessons=avoid_lessons,
+                telemetry=telemetry,
+            ))))
+    _done, pending = await asyncio.wait(
+        [task for _, _, task in calls], timeout=settings.BATTLE_AI_GENERATION_TIMEOUT_SECONDS,
+    )
 
-    results: dict[str, list[dict]] = {}
-    for difficulty, task in tasks.items():
+    results: dict[str, list[dict]] = {difficulty: [] for difficulty in wanted}
+    for difficulty, telemetry, task in calls:
         if task in pending:
-            stats["timed_out_tiers"] += 1
-            results[difficulty] = []
+            stats["late_batches"] += 1
+            _kickoff_late_ai_save(subject=subject, difficulty=difficulty, task=task)
             continue
         exc = task.exception()
         if exc is not None:
-            stats["failed_tiers"] += 1
+            stats["failed_batches"] += 1
             logger.warning("AI battle questions failed subject=%s difficulty=%s: %s", subject, difficulty, exc)
-            results[difficulty] = []
             continue
-        results[difficulty] = task.result()
-        stats["invalid"] += telemetry_by_tier[difficulty].get("invalid_question_count", 0)
+        results[difficulty].extend(task.result())
+        stats["invalid"] += telemetry.get("invalid_question_count", 0)
     return results, stats
+
+
+def _kickoff_late_ai_save(*, subject: str, difficulty: str, task: asyncio.Task) -> None:
+    # Fire-and-forget, like _kickoff_pool_replenish: the match has already started without this batch.
+    asyncio.create_task(_save_late_ai_batch(subject=subject, difficulty=difficulty, task=task))
+
+
+async def _save_late_ai_batch(*, subject: str, difficulty: str, task: asyncio.Task) -> None:
+    """Waits (up to BATTLE_AI_LATE_BATCH_MAX_SECONDS) for an AI batch that missed its match's start, then adds its
+    questions to the pool -- skipping any that repeat or near-copy a question already there -- so the slow call
+    still grows the never-seen pool for the next matches. Never raises."""
+    try:
+        batch = await asyncio.wait_for(task, timeout=settings.BATTLE_AI_LATE_BATCH_MAX_SECONDS)
+    except (TimeoutError, HTTPException) as exc:  # still too slow (the call is cancelled), or the AI call failed
+        logger.info(
+            "Late AI battle batch dropped subject=%s difficulty=%s: %s", subject, difficulty, type(exc).__name__,
+        )
+        return
+    except Exception:
+        logger.exception("Late AI battle batch failed unexpectedly subject=%s difficulty=%s", subject, difficulty)
+        return
+    try:
+        async with AsyncSessionLocal() as session:
+            pool_rows = (
+                await session.execute(
+                    select(Question.question, Question.question_fingerprint).where(Question.subject == subject)
+                )
+            ).all()
+            texts = [row[0] for row in pool_rows]
+            fingerprints = {row[1] for row in pool_rows}
+            added = 0
+            for item in batch:
+                text = item["question"]
+                fingerprint = compute_question_fingerprint(subject, item["lesson"], text)
+                if references_missing_visual(text) or fingerprint in fingerprints or is_near_duplicate(text, texts):
+                    continue
+                session.add(Question(
+                    question=text, options=item["options"], correct_answer=item["correct_answer"],
+                    subject=subject, lesson=item["lesson"], difficulty=difficulty,
+                ))
+                fingerprints.add(fingerprint)
+                texts.append(text)
+                added += 1
+            if added:
+                await session.commit()
+        logger.info(
+            "Late AI battle batch saved to the pool subject=%s difficulty=%s: %d of %d new",
+            subject, difficulty, added, len(batch),
+        )
+    except Exception:
+        logger.exception("Saving a late AI battle batch failed subject=%s difficulty=%s", subject, difficulty)
 
 
 async def _ai_first_questions(
@@ -508,14 +562,16 @@ async def _ai_first_questions(
     latency_ms = (time.monotonic() - started) * 1000
     logger.info(
         "AI battle questions subject=%s: %d/%d for this match (%d new saved to the pool, %d repeats/near-copies "
-        "dropped, %d tier(s) failed, %d timed out) in %.0fms",
-        subject, used, needed, saved, duplicates, stats["failed_tiers"], stats["timed_out_tiers"], latency_ms,
+        "dropped, %d batch(es) failed, %d still running -- saved to the pool when done) in %.0fms",
+        subject, used, needed, saved, duplicates, stats["failed_batches"], stats["late_batches"], latency_ms,
     )
     _kickoff_ai_telemetry(
         subject=subject, requested=stats["requested"], generated=saved,
         success=used >= needed, used_pool=used < needed, duplicates=duplicates,
         invalid=stats["invalid"], latency_ms=latency_ms,
-        error_category=None if used >= needed else ("provider_error" if stats["failed_tiers"] or stats["timed_out_tiers"] else "insufficient_pool"),
+        error_category=None if used >= needed else (
+            "provider_error" if stats["failed_batches"] or stats["late_batches"] else "insufficient_pool"
+        ),
     )
     return picked
 

@@ -105,8 +105,9 @@ async def test_fresh_ai_questions_fill_the_whole_match_and_join_the_pool(db_sess
     assert len(result) == 10 and len({q.id for q in result}) == 10
     assert all(q.id is not None for q in result)  # saved to the pool
     assert sorted(q.difficulty for q in result) == ["easy"] * 7 + ["medium"] * 3
-    # Asked for spares: 7 + ceil(7*0.4)=3, 3 + ceil(3*0.4)=2.
-    assert sorted(c.kwargs["question_count"] for c in mock.await_args_list) == [5, 10]
+    # Asked for spares (7 + ceil(7*0.4)=3 -> 10, 3 + ceil(3*0.4)=2 -> 5), in batches of at most 4: 10 -> 4+3+3,
+    # 5 -> 3+2, all at once.
+    assert sorted(c.kwargs["question_count"] for c in mock.await_args_list) == [2, 3, 3, 3, 4]
     # The spares stay in the pool for later matches.
     assert await db_session.scalar(select(func.count()).select_from(Question)) == 15
 
@@ -247,3 +248,62 @@ async def test_busy_ai_slots_go_straight_to_the_pool(db_session, ai_on, monkeypa
 
     mock.assert_not_awaited()
     assert {q.id for q in result} == {q.id for q in pool}
+
+
+
+def test_batches_are_near_equal_and_never_over_the_size():
+    assert battle_question_service._batch_sizes(10, 4) == [4, 3, 3]
+    assert battle_question_service._batch_sizes(5, 4) == [3, 2]
+    assert battle_question_service._batch_sizes(4, 4) == [4]
+    assert battle_question_service._batch_sizes(1, 4) == [1]
+
+
+async def test_one_slow_batch_costs_only_its_own_questions(db_session, ai_on, monkeypatch):
+    monkeypatch.setattr(settings, "BATTLE_AI_GENERATION_TIMEOUT_SECONDS", 0.3)
+    a, b = await _users(db_session)
+    pool = [_pool_question(i) for i in range(4)]
+    db_session.add_all(pool)
+    await db_session.commit()
+    calls = iter(range(100))
+
+    async def one_slow(**kw):
+        n = next(calls)
+        if n == 0:
+            await asyncio.sleep(5)  # this batch misses the match start
+        return [_ai_item(10 * n + i) for i in range(kw["question_count"])]
+
+    monkeypatch.setattr(battle_question_service, "generate_questions", one_slow)
+
+    result = await select_battle_questions(
+        db_session, subject="Mathematics", tier_counts={"medium": 7}, participant_user_ids=(a, b),
+    )
+
+    # 7 + 3 spares = 10 asked as 4+3+3; the slow batch of 4 is lost to this match, the other 6 cover it.
+    assert len(result) == 7
+    assert sum(q.lesson == "Geometry" for q in result) == 6
+
+
+async def test_a_late_batch_lands_in_the_pool_without_duplicates(db_session, monkeypatch):
+    existing = _pool_question(1)
+    db_session.add(existing)
+    await db_session.commit()
+
+    class _Session:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(battle_question_service, "AsyncSessionLocal", _Session)
+
+    async def finished_late():
+        return [_ai_item(0), _ai_item(1), {**_ai_item(2), "question": existing.question, "lesson": existing.lesson}]
+
+    await battle_question_service._save_late_ai_batch(
+        subject="Mathematics", difficulty="medium", task=asyncio.ensure_future(finished_late()),
+    )
+
+    texts = [q for q in (await db_session.execute(select(Question.question))).scalars()]
+    assert _ai_item(0)["question"] in texts and _ai_item(1)["question"] in texts
+    assert texts.count(existing.question) == 1  # the copy of a pool question was skipped

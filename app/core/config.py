@@ -189,13 +189,19 @@ class Settings(BaseSettings):
     # Ask for this much more than needed (rounded up, at least 1 per tier),
     # so questions dropped as repeats/near-duplicates still leave enough.
     BATTLE_AI_OVERGENERATE_RATIO: float = 0.4
+    # Each difficulty's request is split into AI calls of at most this many questions, all made at once: a short
+    # answer comes back much faster than a long one, and one slow call then costs a few questions, not a tier.
+    BATTLE_AI_BATCH_SIZE: int = 4
+    # A call still running when the match starts isn't wasted: it's left to finish in the background (up to this
+    # long) and its questions are added to the pool for later matches.
+    BATTLE_AI_LATE_BATCH_MAX_SECONDS: float = 45.0
     # Matches generating at once per process; any match beyond this just
     # uses the pool, so a burst of matches can't run into Groq's rate limit.
     BATTLE_AI_MAX_CONCURRENT_GENERATIONS: int = 4
     # How many of the two players' most recently seen questions are listed
     # in the AI prompt as "don't repeat these" (every seen question is still
     # filtered out afterwards either way).
-    BATTLE_AI_AVOID_RECENT_QUESTIONS: int = 60
+    BATTLE_AI_AVOID_RECENT_QUESTIONS: int = 25
     # The lessons the two players have seen most, passed to the AI as
     # "prefer other lessons" -- spreads matches across the syllabus.
     BATTLE_AI_AVOID_TOP_LESSONS: int = 5
@@ -255,7 +261,9 @@ class Settings(BaseSettings):
     # supported -- see app/api/routes/battle_ws.py's module docstring) and
     # for the rare real connection that's delayed past this. Enforced by
     # run_stale_match_reap_once, not a live timer -- see its docstring.
-    BATTLE_CONNECTION_READY_TIMEOUT_SECONDS: float = 8.0
+    # Kept well above BATTLE_AI_GENERATION_TIMEOUT_SECONDS: a match whose questions are still being generated is
+    # also "ready but not yet started", and must not be mistaken for a stalled one.
+    BATTLE_CONNECTION_READY_TIMEOUT_SECONDS: float = 20.0
     # Safety-net TTL for an abandoned ready hash (e.g. one side readies then
     # vanishes and the match is never cancelled/completed) -- not the
     # primary lifecycle mechanism.
