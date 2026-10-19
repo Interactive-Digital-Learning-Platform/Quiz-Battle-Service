@@ -12,6 +12,8 @@ ENV/
 # Environment variables and local secrets
 .env
 .env.*
+# Spelled out too (already covered by .env.*): local backup of the pre-Singapore database settings.
+.env.bak-useast1
 !.env.example
 
 # Test, coverage, and tooling caches
