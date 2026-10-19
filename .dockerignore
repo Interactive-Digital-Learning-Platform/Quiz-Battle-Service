@@ -1,0 +1,17 @@
+# Allow-list: the build context is ONLY what the image needs. Anything not re-included below (local .env files, .venv,
+# .git, caches, tests, scripts) never reaches `docker build` -- so a new local file can't leak into an image by accident.
+*
+
+!pyproject.toml
+!uv.lock
+!alembic.ini
+!alembic/
+!app/
+
+# ...and never these, even inside the re-included folders.
+**/__pycache__/
+**/*.py[cod]
+**/.DS_Store
+**/*.db
+**/.env
+**/.env.*

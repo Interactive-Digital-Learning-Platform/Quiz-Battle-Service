@@ -1,0 +1,78 @@
+# --- Build & deploy to Azure Container Apps ---
+#
+# On every push to main: build the image, push it to ACR tagged with the
+# commit SHA, and roll it out to the `quiz-battle-service` Container App.
+#
+# Auth: OIDC federated credential on the `github-nous-deployer` managed
+# identity. Requires the AZURE_CLIENT_ID / AZURE_TENANT_ID /
+# AZURE_SUBSCRIPTION_ID secrets (org level).
+#
+# Env values live on the Container App and are never touched here. Alembic
+# migrations are not run on deploy: apply them by hand before merging changes
+# that need them.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "tests/**"
+      - "scripts/**"
+      - "docker-compose.yml"
+
+permissions:
+  id-token: write # OIDC login to Azure
+  contents: read
+
+# Never run two deploys at once; a newer push waits for the current one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: Nous-Azure
+  ACR_NAME: nouscontainerregistry
+  ACR_LOGIN_SERVER: nouscontainerregistry-dydgemargghucgcz.azurecr.io
+  IMAGE_NAME: quiz-battle-service
+  BATTLE_APP: quiz-battle-service
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name "$ACR_NAME"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy battle service
+        run: |
+          az containerapp update \
+            --name "$BATTLE_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_LOGIN_SERVER/$IMAGE_NAME:${{ github.sha }}" \
+            --query "properties.latestRevisionName" -o tsv
